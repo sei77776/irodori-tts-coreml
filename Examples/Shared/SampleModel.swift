@@ -11,6 +11,64 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     let fileName: String
 }
 
+/// Combined output of one request, which may span several synthesize calls (one per tone segment).
+struct SpeechOutput {
+    let pcm16: Data
+    let synthesisMilliseconds: Double
+    let firstPCMMilliseconds: Double
+    var audioSeconds: Double { Double(pcm16.count) / 96_000 }
+    var rtf: Double { synthesisMilliseconds / 1000 / max(audioSeconds, 0.000001) }
+}
+
+/// Tone read from sentence-final punctuation, used to add a style instruction per sentence.
+enum SentenceTone: Equatable {
+    case neutral, emphatic, excited, question
+
+    var instruction: String {
+        switch self {
+        case .neutral: return ""
+        case .emphatic: return "感情を込めて、はっきりと力強く話す。"
+        case .excited: return "とても興奮して、大きな声で勢いよく話す。"
+        case .question: return "問いかけるように、語尾を上げて話す。"
+        }
+    }
+
+    /// Splits text after 。！？!? or a newline and merges neighbouring sentences with the same tone.
+    static func segments(of text: String) -> [(text: String, tone: SentenceTone)] {
+        var sentences: [String] = []
+        var current = ""
+        var previousWasEnd = false
+        for character in text {
+            let isEnd = "。！？!?\n".contains(character)
+            if previousWasEnd && !isEnd {
+                sentences.append(current); current = ""
+            }
+            current.append(character)
+            previousWasEnd = isEnd
+        }
+        sentences.append(current)
+        var result: [(text: String, tone: SentenceTone)] = []
+        for sentence in sentences where !sentence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let tone = classify(sentence)
+            if let last = result.last, last.tone == tone {
+                result[result.count - 1].text += sentence
+            } else {
+                result.append((sentence, tone))
+            }
+        }
+        return result
+    }
+
+    static func classify(_ sentence: String) -> SentenceTone {
+        let trailing = sentence.trimmingCharacters(in: .whitespacesAndNewlines).reversed().prefix { "。！？!?".contains($0) }
+        let exclamations = trailing.filter { "！!".contains($0) }.count
+        if exclamations >= 2 { return .excited }
+        if exclamations == 1 { return .emphatic }
+        if trailing.contains(where: { "？?".contains($0) }) { return .question }
+        return .neutral
+    }
+}
+
 @MainActor final class SampleModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var text = "こんにちは。今日はいい天気なので、近くの公園まで散歩に行きましょう。"
     @Published var caption = UserDefaults.standard.string(forKey: "caption") ?? "" {
@@ -27,7 +85,11 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     @Published var consent = false
     @Published var outputURL: URL?
     private let engine = IrodoriEngine()
-    @Published var result: SynthesisResult?
+    @Published var result: SpeechOutput?
+    /// Adds a per-sentence style instruction from ！ / ？ so exclamations are not read flatly.
+    @Published var autoTone = UserDefaults.standard.object(forKey: "autoTone") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoTone, forKey: "autoTone") }
+    }
     @Published var errorMessage: String?
     @Published var ready = false
     @Published var modelPreparationMilliseconds: Double?
@@ -194,7 +256,7 @@ struct SavedVoice: Codable, Identifiable, Hashable {
         streamPlayer = player; streamID = id
         player.onFinished = { [weak self] in self?.streamDidFinish(id) }
         isPlaying = true
-        let result = try await engine.synthesize(text, caption: caption, splitSentences: true) { [weak self] chunk in
+        let onChunk: @Sendable (PCMChunk) -> Void = { [weak self] chunk in
             // Main queue keeps chunk order; stale chunks from a stopped request are dropped.
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -204,9 +266,24 @@ struct SavedVoice: Codable, Identifiable, Hashable {
                 }
             }
         }
+        let userCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+        let segments = autoTone ? SentenceTone.segments(of: text) : [(text: text, tone: SentenceTone.neutral)]
+        var pcm = Data()
+        var synthesisMilliseconds = 0.0
+        var firstPCMMilliseconds: Double?
+        for segment in segments where segment.text.range(of: #"[\p{L}\p{N}]"#, options: .regularExpression) != nil {
+            try Task.checkCancellation()
+            let segmentCaption = [userCaption, segment.tone.instruction].filter { !$0.isEmpty }.joined(separator: " ")
+            let part = try await engine.synthesize(segment.text, caption: segmentCaption, splitSentences: true, onChunk: onChunk)
+            if firstPCMMilliseconds == nil { firstPCMMilliseconds = synthesisMilliseconds + part.firstPCMMilliseconds }
+            synthesisMilliseconds += part.synthesisMilliseconds
+            pcm.append(part.pcm16)
+        }
+        let result = SpeechOutput(pcm16: pcm, synthesisMilliseconds: synthesisMilliseconds,
+                                  firstPCMMilliseconds: firstPCMMilliseconds ?? 0)
         try Task.checkCancellation()
         let url = store.appendingPathComponent("generated.wav")
-        try result.writeWAV(to: url); outputURL = url
+        try ReferenceAudio.writeWAV(pcm16: result.pcm16, to: url); outputURL = url
         statistics += String(format: "\nRTF %.3f / 最初のPCM %.0f ms / 音声 %.2f 秒", result.rtf, result.firstPCMMilliseconds, result.audioSeconds)
         self.result = result
         waveform = Self.envelope(result.pcm16)

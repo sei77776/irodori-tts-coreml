@@ -224,7 +224,7 @@ struct ContentView: View {
         .studioCard()
     }
 
-    private func metrics(_ result: SynthesisResult) -> some View {
+    private func metrics(_ result: SpeechOutput) -> some View {
         HStack(spacing: 0) {
             metric("RTF", value: String(format: "%.3f", result.rtf))
             Divider().frame(height: 34)
@@ -382,6 +382,15 @@ struct ContentView: View {
             .disabled(model.busy || model.recording)
             Text("候補をタップすると入力されます。自由に書き換えても、空欄でも生成できます。")
                 .font(.caption2).foregroundStyle(.secondary)
+            Toggle(isOn: $model.autoTone) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("！や？に合わせて読み分ける").font(.caption.weight(.medium))
+                    Text("文末の記号から、文ごとに話し方の指示を足します")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityIdentifier("autoTone").toggleStyle(.switch)
+            .disabled(model.busy || model.recording)
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 Text("使う声").font(.caption.weight(.medium))
