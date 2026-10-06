@@ -60,5 +60,10 @@
  "credits": [
   "Voice conversion model: Beatrice v2 (beatrice-trainer 2.0.0-rc.0, fierce-cats, MIT License)",
   "Pretrained speakers: trained on LibriTTS-R (CC BY 4.0) and other corpora listed in beatrice-trainer assets/README.md"
- ]
+ ],
+ "pack": {
+  "id": "pretrained",
+  "name": "標準",
+  "order": 1
+ }
 }

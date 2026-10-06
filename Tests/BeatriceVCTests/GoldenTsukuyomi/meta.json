@@ -1,0 +1,22 @@
+{
+ "W": 64,
+ "speaker": 0,
+ "nn_window_start_frame": 150,
+ "dsp_init_phase": 0.3,
+ "dsp_window_start_frame": 1234,
+ "noise_head": [
+  0.38331079483032227,
+  0.06656152009963989,
+  0.0911896824836731,
+  -0.386549711227417,
+  -0.06854420900344849
+ ],
+ "stream": {
+  "chunk": 10,
+  "lookahead": 4,
+  "crossfade": 2,
+  "chunks": 24,
+  "pitch_shift_bins": 0.0,
+  "formant_index": 4
+ }
+}

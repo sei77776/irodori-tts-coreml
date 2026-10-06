@@ -9,6 +9,8 @@ struct VoiceChangerSettings: Codable, Equatable {
     var chunkMs = 100
     var function = "w64"              // w64 / w116 / w216
     var voiceID: Int?
+    /// voice pack of `voiceID` (nil: not chosen yet -> the first pack, つくよみちゃん when bundled)
+    var voicePack: String?
     var pitchShift = 0                // semitones
     var formant = 0.0                 // semitones, -2 ... 2
     var useSpeaker = false
@@ -40,6 +42,12 @@ struct VoiceChangerSettings: Codable, Equatable {
     }
 }
 
+struct PackCredit: Identifiable {
+    var id: String
+    var name: String
+    var lines: [String]
+}
+
 /// 「リアルタイム変声（実験）」: Beatrice v2 pseudo-streaming voice conversion on device.
 @MainActor final class BeatriceViewModel: ObservableObject {
     @Published var settings = VoiceChangerSettings.load() {
@@ -48,39 +56,110 @@ struct VoiceChangerSettings: Codable, Equatable {
             if running, settings.noiseCut != oldValue.noiseCut {
                 engine.setGateThreshold(settings.gateThresholdDB)
             }
+            if settings.voicePack != oldValue.voicePack || settings.quality != oldValue.quality {
+                preload()
+            }
         }
     }
     @Published private(set) var running = false
     @Published private(set) var preparing = false
+    /// compiling / loading the selected pack's model (switching packs swaps the whole model)
+    @Published private(set) var loading = false
     @Published private(set) var measuring = false
     @Published private(set) var status = ""
     @Published private(set) var stats = BeatriceRealtimeEngine.Stats()
-    @Published private(set) var voices: [BeatriceManifest.Voice] = []
-    @Published private(set) var credits: [String] = []
+    @Published private(set) var entries: [BeatriceVoicePacks.Entry] = []
+    @Published private(set) var packCredits: [PackCredit] = []
     @Published private(set) var diagnosticFiles: [URL] = []
 
-    private var assets: BeatriceAssets?
+    private var packs: BeatriceVoicePacks?
     private let engine = BeatriceRealtimeEngine()
     private var timer: Timer?
+    private var loadGeneration = 0
+    private var loadingURL: URL?
 
     init() {
         do {
             guard let dir = Bundle.main.url(forResource: "BeatriceAssets", withExtension: nil) else {
                 throw BeatriceError.missingFile("BeatriceAssets")
             }
-            let assets = try BeatriceAssets(directory: dir)
-            self.assets = assets
-            voices = assets.manifest.voices
-            credits = assets.manifest.credits
-            if settings.voiceID == nil || !voices.contains(where: { $0.id == settings.voiceID }) {
-                settings.voiceID = voices.first?.id
+            let packs = try BeatriceVoicePacks(root: dir)
+            self.packs = packs
+            entries = packs.entries
+            packCredits = packs.packs.map { a in
+                PackCredit(id: a.pack.id, name: a.pack.name, lines: a.manifest.credits + (a.pack.terms ?? []))
             }
+            if selectedKey == nil {
+                // first launch, settings from a build without packs, or a pack that is gone
+                selectVoice(entries.first?.key)
+            }
+            preload()
         } catch {
             status = error.localizedDescription
         }
     }
 
-    var settingsLocked: Bool { running || preparing }
+    var settingsLocked: Bool { running || preparing || loading }
+
+    /// The selected voice, nil when nothing valid is selected.
+    var selectedKey: BeatriceVoicePacks.VoiceKey? {
+        guard let pack = settings.voicePack, let id = settings.voiceID else { return nil }
+        let key = BeatriceVoicePacks.VoiceKey(pack: pack, voice: id)
+        return packs?.entry(for: key) == nil ? nil : key
+    }
+
+    func selectVoice(_ key: BeatriceVoicePacks.VoiceKey?) {
+        guard let key, key != selectedKey else { return }
+        var s = settings
+        s.voicePack = key.pack
+        s.voiceID = key.voice
+        settings = s
+    }
+
+    var selectedAssets: BeatriceAssets? { selectedKey.flatMap { packs?.assets(for: $0) } }
+
+    /// Picker label: a single-voice pack shows its voice name, others "パック：話者".
+    func label(_ e: BeatriceVoicePacks.Entry) -> String {
+        let count = entries.filter { $0.key.pack == e.key.pack }.count
+        return count == 1 ? e.voice.name : "\(e.packName)：\(e.voice.name)"
+    }
+
+    /// Credit that must be visible while the selected voice is in use (e.g. つくよみちゃん).
+    var selectedVoiceCredit: [String] { selectedAssets?.pack.voiceCredit ?? [] }
+    var selectedVoiceTerms: [String] { selectedAssets?.pack.terms ?? [] }
+
+    /// The pack may ship only some precisions; a missing one falls back to 高音質 (fp32).
+    func effectiveQuality(_ s: VoiceChangerSettings) -> String {
+        guard let assets = selectedAssets else { return s.quality }
+        return assets.modelURL(s.quality) != nil ? s.quality : "fp32"
+    }
+
+    var lightweightUnavailable: Bool {
+        guard let assets = selectedAssets else { return false }
+        return assets.modelURL("mixed") == nil
+    }
+
+    /// Compiles (or finds the cached compile of) the selected pack's model in the background, so
+    /// switching between packs shows 読み込み中 instead of stalling the start button.
+    private func preload() {
+        guard !running, let assets = selectedAssets,
+              let url = assets.modelURL(effectiveQuality(settings)) else { return }
+        if loading, loadingURL == url { return }
+        loadingURL = url
+        loadGeneration += 1
+        let generation = loadGeneration
+        loading = true
+        status = "「\(assets.pack.name)」の声を読み込み中…"
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { () -> String? in
+                do { _ = try BeatriceModel.compiledModel(for: url); return nil } catch { return error.localizedDescription }
+            }.value
+            guard generation == loadGeneration else { return }
+            loading = false
+            loadingURL = nil
+            status = result.map { "読み込みに失敗しました: \($0)" } ?? "「\(assets.pack.name)」の声を読み込みました。"
+        }
+    }
 
     func toggle() {
         if running { stop() } else { start() }
@@ -95,19 +174,21 @@ struct VoiceChangerSettings: Codable, Equatable {
     }
 
     func resetSettings() {
-        let voice = settings.voiceID
-        settings = VoiceChangerSettings()
-        settings.voiceID = voice
+        var s = VoiceChangerSettings()
+        s.voiceID = settings.voiceID
+        s.voicePack = settings.voicePack
+        settings = s
     }
 
     private func start() {
         let s = settings
-        guard let assets, let voiceID = s.voiceID, let info = voices.first(where: { $0.id == voiceID }) else { return }
+        guard !loading, let key = selectedKey, let assets = packs?.assets(for: key),
+              let info = packs?.entry(for: key)?.voice else { return }
         guard #available(iOS 18.0, macOS 15.0, *) else {
             status = "この機能は iOS 18 / macOS 15 以降が必要です。"
             return
         }
-        guard let url = assets.modelURL(s.quality), let window = assets.manifest.functions[s.function] else {
+        guard let url = assets.modelURL(effectiveQuality(s)), let window = assets.manifest.functions[s.function] else {
             status = "モデルが同梱されていません。"
             return
         }
@@ -214,8 +295,8 @@ struct BeatriceView: View {
                 }
 
                 Section("声") {
-                    Picker("話者", selection: $model.settings.voiceID) {
-                        ForEach(model.voices) { Text($0.name).tag(Optional($0.id)) }
+                    Picker("話者", selection: Binding(get: { model.selectedKey }, set: { model.selectVoice($0) })) {
+                        ForEach(model.entries) { Text(model.label($0)).tag(Optional($0.key)) }
                     }
                     Stepper(value: $model.settings.pitchShift, in: -12...12) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -231,6 +312,20 @@ struct BeatriceView: View {
                     }
                 }
                 .disabled(model.settingsLocked)
+
+                if !model.selectedVoiceCredit.isEmpty {
+                    // License requirement: shown prominently whenever this voice is selected.
+                    Section("この声について") {
+                        voiceCredit(model.selectedVoiceCredit)
+                        if !model.selectedVoiceTerms.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(model.selectedVoiceTerms, id: \.self) { Text($0) }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                }
 
                 Section {
                     VStack(alignment: .leading) {
@@ -274,6 +369,10 @@ struct BeatriceView: View {
                         Text("高音質").tag("fp32")
                         Text("軽量（電池・発熱に優しい）").tag("mixed")
                     }
+                    if model.lightweightUnavailable {
+                        Text("この声は高音質のみです（軽量を選んでも高音質で動きます）。")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
                     Picker("計算に使う部分", selection: $model.settings.computeUnits) {
                         Text("CPU").tag(BeatriceComputeUnits.cpuOnly.rawValue)
                         Text("GPU（おすすめ）").tag(BeatriceComputeUnits.cpuAndGPU.rawValue)
@@ -305,11 +404,11 @@ struct BeatriceView: View {
                     Button {
                         model.toggle()
                     } label: {
-                        Label(model.running ? "停止" : (model.preparing ? "準備中…" : "開始"),
+                        Label(model.running ? "停止" : (model.preparing ? "準備中…" : (model.loading ? "読み込み中…" : "開始")),
                               systemImage: model.running ? "stop.fill" : "mic.fill")
                             .frame(maxWidth: .infinity)
                     }
-                    .disabled(model.preparing || model.settings.voiceID == nil)
+                    .disabled(model.preparing || model.loading || model.selectedKey == nil)
                     if !model.status.isEmpty {
                         Text(model.status).font(.caption).foregroundStyle(.secondary)
                     }
@@ -352,8 +451,13 @@ struct BeatriceView: View {
                 }
 
                 Section("クレジット") {
-                    ForEach(model.credits, id: \.self) { Text($0).font(.caption) }
-                    Text("話者は事前学習モデルに含まれる話者を番号で表示しています（LibriTTS-R 由来、CC BY 4.0）。")
+                    ForEach(model.packCredits) { pack in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("声：\(pack.name)").font(.caption.bold())
+                            ForEach(pack.lines, id: \.self) { Text($0).font(.caption) }
+                        }
+                    }
+                    Text("「標準」の話者は事前学習モデルに含まれる話者を番号で表示しています（LibriTTS-R 由来、CC BY 4.0）。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -372,6 +476,20 @@ struct BeatriceView: View {
         #if os(macOS)
         .frame(minWidth: 520, minHeight: 640)
         #endif
+    }
+
+    /// Credit lines; a line that is a URL becomes a link.
+    private func voiceCredit(_ lines: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(lines, id: \.self) { line in
+                if line.hasPrefix("https://"), let url = URL(string: line) {
+                    Link(line, destination: url)
+                } else {
+                    Text(line)
+                }
+            }
+        }
+        .font(.footnote)
     }
 
     private var pitchText: String {

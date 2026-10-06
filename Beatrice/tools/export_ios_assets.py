@@ -17,6 +17,17 @@ attention). The app picks a function by context length and derives the left cont
 To use a speaker trained on Colab, point BEATRICE_NET_G at the fine-tuned checkpoint
 (checkpoint_latest.pt.gz) and pass --speakers all: the vocoder weights change with fine-tuning,
 so the models must be re-exported together with the voices.
+
+Voice packs: the app loads every directory under Examples/BeatriceAssets that has a voices.json
+(the root = the pretrained pack). Export a fine-tuned speaker into its own subdirectory and describe
+it with --pack-json (merged into voices.json: "pack" {id, name, order, voice_credit, terms} and
+"credits"). --models limits the exported precisions; voices.json lists only the models present.
+The Tsukuyomi-chan pack was made with:
+
+  BEATRICE_NET_G=tsukuyomi_checkpoint_10000.pt.gz python -I export_ios_assets.py \
+      --assets ../../Examples/BeatriceAssets/tsukuyomi --golden ../../Tests/BeatriceVCTests/GoldenTsukuyomi \
+      --speakers all --label つくよみちゃん --models BeatriceFP32 \
+      --pack-json packs/tsukuyomi.json
 """
 import argparse
 import json
@@ -154,7 +165,7 @@ def export_models(pe, ps, g, se, kv, cb, assets, tmp, which):
     return info
 
 
-def export_voices(g, ids, assets, label):
+def export_voices(g, ids, assets, label, extra=None, models=("BeatriceFP32", "BeatriceMixed")):
     os.makedirs(assets, exist_ok=True)
     voices = []
     for i in ids:
@@ -163,7 +174,8 @@ def export_voices(g, ids, assets, label):
         cb = g.vq.codebooks[i].detach().float().numpy().reshape(-1)
         fn = f"voice_{i:03d}.bin"
         np.concatenate([se, kv, cb]).astype("<f4").tofile(os.path.join(assets, fn))
-        voices.append({"id": i, "name": f"{label} #{i}", "file": fn})
+        name = label if len(ids) == 1 else f"{label} #{i}"
+        voices.append({"id": i, "name": name, "file": fn})
     common = np.concatenate([g.vocoder.ir_window.detach().float().numpy(),
                              g.embed_formant_shift.weight.detach().float().numpy().reshape(-1)])
     common.astype("<f4").tofile(os.path.join(assets, "common.bin"))
@@ -175,12 +187,14 @@ def export_voices(g, ids, assets, label):
         "functions": FUNCTIONS,
         "lookahead_frames": LOOKAHEAD,
         "crossfade_frames": CROSSFADE,
-        "models": {"fp32": "BeatriceFP32.mlpackage", "mixed": "BeatriceMixed.mlpackage"},
+        "models": {k: f"{n}.mlpackage" for k, n in (("fp32", "BeatriceFP32"), ("mixed", "BeatriceMixed"))
+                   if n in models},
         "credits": [
             "Voice conversion model: Beatrice v2 (beatrice-trainer 2.0.0-rc.0, fierce-cats, MIT License)",
             "Pretrained speakers: trained on LibriTTS-R (CC BY 4.0) and other corpora listed in beatrice-trainer assets/README.md",
         ],
     }
+    meta.update(extra or {})
     with open(os.path.join(assets, "voices.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
 
@@ -232,6 +246,7 @@ def main():
     ap.add_argument("--tmp", default="/tmp/beatrice_export")
     ap.add_argument("--speakers", default="auto5", help="autoN | all | comma-separated ids")
     ap.add_argument("--label", default="話者")
+    ap.add_argument("--pack-json", help="JSON merged into voices.json (pack metadata, credits)")
     ap.add_argument("--models", default="", help="comma list of BeatriceFP32,BeatriceMixed (default both)")
     ap.add_argument("--skip-models", action="store_true")
     a = ap.parse_args()
@@ -246,10 +261,17 @@ def main():
     else:
         ids = [int(s) for s in a.speakers.split(",")]
     print("speakers:", ids, flush=True)
-    export_voices(g, ids, a.assets, a.label)
+    which = set(filter(None, a.models.split(",")))
+    extra = None
+    if a.pack_json:
+        with open(a.pack_json, encoding="utf-8") as f:
+            extra = json.load(f)
+    present = [n for n in ("BeatriceFP32", "BeatriceMixed")
+               if (not which or n in which) or os.path.isdir(os.path.join(a.assets, n + ".mlpackage"))]
+    export_voices(g, ids, a.assets, a.label, extra, present)
     se, kv, cb = speaker_inputs(g, ids[0])
     if not a.skip_models:
-        info = export_models(pe, ps, g, se, kv, cb, a.assets, a.tmp, set(filter(None, a.models.split(","))))
+        info = export_models(pe, ps, g, se, kv, cb, a.assets, a.tmp, which)
         print("model sizes MB:", info)
     if a.golden:
         export_golden(pe, ps, g, ids[0], a.golden)
