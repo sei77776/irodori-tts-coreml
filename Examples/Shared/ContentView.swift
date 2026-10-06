@@ -179,13 +179,35 @@ struct ContentView: View {
                 .buttonStyle(GenerateButtonStyle())
                 .accessibilityIdentifier("speak")
                 .disabled(model.busy || model.recording || model.modelPath.isEmpty || model.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if model.busy || model.isPlaying {
+                if model.busy || model.isPlaying || model.relayActive {
                     Button(action: model.stop) {
                         Image(systemName: "stop.fill").frame(width: 48, height: 48)
                     }
                     .buttonStyle(.bordered).buttonBorderShape(.roundedRectangle(radius: 14))
                     .accessibilityLabel("停止").accessibilityIdentifier("stop")
                 }
+            }
+            Button {
+                focusedField = nil
+                model.toggleRelay()
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: model.relayActive ? "mic.fill" : "mic")
+                    Text(model.relayActive ? "変声モードを終了" : "話して変換（変声モード）")
+                }
+                .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.bordered).buttonBorderShape(.roundedRectangle(radius: 14))
+            .tint(model.relayActive ? .red : StudioStyle.accent)
+            .accessibilityIdentifier("relay")
+            .disabled(model.modelPath.isEmpty || model.recording || (model.busy && !model.relayActive))
+            if model.relayActive {
+                Text(model.heardText.isEmpty ? "（話しかけてください）" : model.heardText)
+                    .font(.callout).foregroundStyle(model.heardText.isEmpty ? .tertiary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12).background(StudioStyle.canvas, in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityIdentifier("heardText")
             }
             HStack(alignment: .top, spacing: 9) {
                 if model.busy { ProgressView().controlSize(.small) }
