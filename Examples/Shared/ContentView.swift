@@ -28,6 +28,9 @@ struct ContentView: View {
     @State private var importing = false
     @State private var importKind: ImportKind = .model
     @State private var downloadExpanded = false
+    @State private var renamingVoice: SavedVoice?
+    @State private var renameText = ""
+    @State private var deletingVoice: SavedVoice?
     #if os(macOS)
     @State private var exportingWAV = false
     @State private var wavDocument: SampleWAVDocument?
@@ -80,6 +83,26 @@ struct ContentView: View {
             }
         }
         #endif
+        .alert("声の名前を変更", isPresented: Binding(get: { renamingVoice != nil },
+                                                set: { if !$0 { renamingVoice = nil } })) {
+            TextField("名前", text: $renameText)
+            Button("保存") {
+                if let voice = renamingVoice { model.renameVoice(voice.id, to: renameText) }
+                renamingVoice = nil
+            }
+            Button("キャンセル", role: .cancel) { renamingVoice = nil }
+        }
+        .alert("「\(deletingVoice?.name ?? "")」を削除しますか？",
+               isPresented: Binding(get: { deletingVoice != nil },
+                                    set: { if !$0 { deletingVoice = nil } })) {
+            Button("削除", role: .destructive) {
+                if let voice = deletingVoice { model.deleteVoice(voice.id) }
+                deletingVoice = nil
+            }
+            Button("キャンセル", role: .cancel) { deletingVoice = nil }
+        } message: {
+            Text("アプリ内に保存した音声ファイルを削除します。")
+        }
         #if os(iOS)
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
@@ -308,16 +331,63 @@ struct ContentView: View {
             HStack {
                 Label("声と話し方", systemImage: "person.wave.2").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(model.referencePath.isEmpty ? "参照なし" : "登録音声あり")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text(model.selectedVoice?.name ?? "参照なし")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             TextField("落ち着いた、やさしい話し方。", text: $model.caption, axis: .vertical)
                 .accessibilityIdentifier("voiceCaption").lineLimit(2...4).textFieldStyle(.plain)
                 .focused($focusedField, equals: .caption)
                 .padding(12).background(StudioStyle.canvas, in: RoundedRectangle(cornerRadius: 12))
                 .disabled(model.busy || model.recording)
-            Text("声や話し方を短く指定できます。空欄でも生成できます。")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(Self.captionPresets, id: \.self) { preset in
+                        let selected = model.caption == preset
+                        Button {
+                            focusedField = nil
+                            model.caption = selected ? "" : preset
+                        } label: {
+                            Text(preset).font(.caption).lineLimit(1)
+                                .padding(.horizontal, 11).padding(.vertical, 7)
+                                .foregroundStyle(selected ? StudioStyle.buttonInk : Color.primary)
+                                .background(selected ? StudioStyle.accent : StudioStyle.accent.opacity(0.08), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .accessibilityIdentifier("captionPresets")
+            .disabled(model.busy || model.recording)
+            Text("候補をタップすると入力されます。自由に書き換えても、空欄でも生成できます。")
                 .font(.caption2).foregroundStyle(.secondary)
+            Divider()
+            VStack(alignment: .leading, spacing: 10) {
+                Text("使う声").font(.caption.weight(.medium))
+                Picker("使う声", selection: Binding(get: { model.selectedVoiceID },
+                                                   set: { model.selectVoice($0) })) {
+                    Text("参照なし").tag(UUID?.none)
+                    ForEach(model.voices) { voice in
+                        Text(voice.name).tag(Optional(voice.id))
+                    }
+                }
+                .pickerStyle(.menu).labelsHidden()
+                .accessibilityIdentifier("voicePicker")
+                .disabled(model.busy || model.recording)
+                if let voice = model.selectedVoice {
+                    HStack {
+                        Button {
+                            renameText = voice.name; renamingVoice = voice
+                        } label: { Label("名前を変更", systemImage: "pencil") }
+                        Spacer(minLength: 8)
+                        Button(role: .destructive) { deletingVoice = voice } label: {
+                            Label("この声を削除", systemImage: "trash")
+                        }
+                        .accessibilityIdentifier("deleteReference")
+                    }
+                    .font(.caption).buttonStyle(.plain)
+                    .disabled(model.busy || model.recording)
+                }
+            }
             Divider()
             Toggle(isOn: $model.consent) {
                 VStack(alignment: .leading, spacing: 4) {
@@ -347,15 +417,22 @@ struct ContentView: View {
                 Label("録音中 · 3〜10秒を目安に停止してください", systemImage: "record.circle")
                     .font(.caption).foregroundStyle(.red)
             }
-            if !model.referencePath.isEmpty {
-                Button(role: .destructive, action: model.deleteReference) {
-                    Label("登録音声とキャッシュを削除", systemImage: "trash")
-                }
-                .font(.caption).buttonStyle(.plain).accessibilityIdentifier("deleteReference")
-                .disabled(model.busy || model.recording)
-            }
+            Text("録音・取り込んだ声は一覧に追加され、上の「使う声」から切り替えられます。")
+                .font(.caption2).foregroundStyle(.secondary)
         }.studioCard()
     }
+
+    /// Short Japanese style instructions in the same form as the SDK examples.
+    static let captionPresets = [
+        "落ち着いた、やさしい話し方。",
+        "明るく元気な話し方。",
+        "ゆっくり、はっきりとした話し方。",
+        "ニュースを読み上げるような、落ち着いた話し方。",
+        "ささやくような、静かな話し方。",
+        "楽しそうに、笑顔で話す。",
+        "悲しそうに、しんみりと話す。",
+        "感情を込めて、ドラマチックに話す。",
+    ]
 }
 
 private struct GenerateButtonStyle: ButtonStyle {

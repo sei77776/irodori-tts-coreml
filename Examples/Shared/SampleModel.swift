@@ -3,13 +3,21 @@ import AVFoundation
 import CryptoKit
 import IrodoriTTS
 
+/// A registered reference voice. Only the file name is persisted; files live in the app's References folder.
+struct SavedVoice: Codable, Identifiable, Hashable {
+    let id: UUID
+    var name: String
+    let fileName: String
+}
+
 @MainActor final class SampleModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var text = "こんにちは。今日はいい天気なので、近くの公園まで散歩に行きましょう。"
     @Published var caption = UserDefaults.standard.string(forKey: "caption") ?? "" {
         didSet { UserDefaults.standard.set(caption, forKey: "caption") }
     }
     @Published var modelPath = UserDefaults.standard.string(forKey: "modelPath") ?? ""
-    @Published var referencePath = UserDefaults.standard.string(forKey: "referencePath") ?? ""
+    @Published private(set) var voices: [SavedVoice] = []
+    @Published private(set) var selectedVoiceID: UUID?
     @Published var manifestURL = ""
     @Published var status = "モデルフォルダを選んでください。"
     @Published var statistics = ""
@@ -39,10 +47,7 @@ import IrodoriTTS
             .appendingPathComponent("IrodoriSample", isDirectory: true)
         super.init()
         try? FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
-        // Recorded files stay inside this app's container; only persist their basename.
-        if !referencePath.isEmpty {
-            referencePath = store.appendingPathComponent("References/\(URL(fileURLWithPath: referencePath).lastPathComponent)").path
-        }
+        loadVoices()
         if !modelPath.isEmpty && !FileManager.default.fileExists(atPath: modelPath) {
             let replacement = store.appendingPathComponent("Models/\(URL(fileURLWithPath: modelPath).lastPathComponent)")
             if FileManager.default.fileExists(atPath: replacement.path) { modelPath = replacement.path }
@@ -118,9 +123,7 @@ import IrodoriTTS
             let destination = self.store.appendingPathComponent("References/\(UUID().uuidString).\(source.pathExtension)")
             try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             try await Task.detached { _ = try ReferenceAudio.read(source); try FileManager.default.copyItem(at: source, to: destination) }.value
-            self.ready = false
-            self.referencePath = destination.path
-            UserDefaults.standard.set(destination.path, forKey: "referencePath")
+            self.addVoice(file: destination, name: source.deletingPathExtension().lastPathComponent)
             self.status = "参照音声を登録しました。"
         }
     }
@@ -269,17 +272,89 @@ import IrodoriTTS
         }
     }
 
-    func deleteReference() {
+    // MARK: - Voice library
+
+    var selectedVoice: SavedVoice? { voices.first { $0.id == selectedVoiceID } }
+    /// Path of the selected voice's audio, or empty when generating without a reference.
+    var referencePath: String {
+        guard let voice = selectedVoice else { return "" }
+        return referencesDirectory.appendingPathComponent(voice.fileName).path
+    }
+    private var referencesDirectory: URL { store.appendingPathComponent("References", isDirectory: true) }
+
+    func selectVoice(_ id: UUID?) {
+        guard !busy, !recording, id != selectedVoiceID else { return }
+        selectedVoiceID = id
+        ready = false
+        saveVoices()
+        status = selectedVoice.map { "「\($0.name)」を使います。" } ?? "参照なしで生成します。"
+    }
+
+    func renameVoice(_ id: UUID, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let index = voices.firstIndex(where: { $0.id == id }) else { return }
+        voices[index].name = trimmed
+        saveVoices()
+    }
+
+    func deleteVoice(_ id: UUID) {
+        guard let voice = voices.first(where: { $0.id == id }) else { return }
         work {
             self.stopPlayback()
             try await self.engine.clearReferenceCache()
-            // Delete only this sample's imported/recorded files, never the selected original.
-            let directory = self.store.appendingPathComponent("References")
-            if FileManager.default.fileExists(atPath: directory.path) { try FileManager.default.removeItem(at: directory) }
+            // Delete only this sample's imported/recorded copy, never the selected original.
+            let file = self.referencesDirectory.appendingPathComponent(voice.fileName)
+            if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            self.voices.removeAll { $0.id == id }
+            if self.selectedVoiceID == id { self.selectedVoiceID = nil }
             self.ready = false
-            self.referencePath = ""; UserDefaults.standard.removeObject(forKey: "referencePath")
-            self.status = "登録音声と参照特徴キャッシュを削除しました。"
+            self.saveVoices()
+            self.status = "「\(voice.name)」と参照特徴キャッシュを削除しました。"
         }
+    }
+
+    private func addVoice(file: URL, name: String) {
+        let base = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let root = base.isEmpty ? "声" : base
+        var unique = root
+        var suffix = 2
+        while voices.contains(where: { $0.name == unique }) { unique = "\(root) \(suffix)"; suffix += 1 }
+        let voice = SavedVoice(id: UUID(), name: unique, fileName: file.lastPathComponent)
+        voices.append(voice)
+        selectedVoiceID = voice.id
+        ready = false
+        saveVoices()
+    }
+
+    private func loadVoices() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: "voices"),
+           let saved = try? JSONDecoder().decode([SavedVoice].self, from: data) {
+            voices = saved.filter { FileManager.default.fileExists(atPath: referencesDirectory.appendingPathComponent($0.fileName).path) }
+        }
+        if let id = defaults.string(forKey: "selectedVoiceID").flatMap(UUID.init(uuidString:)),
+           voices.contains(where: { $0.id == id }) {
+            selectedVoiceID = id
+        }
+        // Earlier builds kept a single reference under "referencePath"; carry it over as the first voice.
+        if let legacy = defaults.string(forKey: "referencePath") {
+            let fileName = URL(fileURLWithPath: legacy).lastPathComponent
+            if FileManager.default.fileExists(atPath: referencesDirectory.appendingPathComponent(fileName).path),
+               !voices.contains(where: { $0.fileName == fileName }) {
+                let voice = SavedVoice(id: UUID(), name: "登録音声 1", fileName: fileName)
+                voices.insert(voice, at: 0)
+                selectedVoiceID = voice.id
+            }
+            defaults.removeObject(forKey: "referencePath")
+            saveVoices()
+        }
+    }
+
+    private func saveVoices() {
+        let defaults = UserDefaults.standard
+        if let data = try? JSONEncoder().encode(voices) { defaults.set(data, forKey: "voices") }
+        if let id = selectedVoiceID { defaults.set(id.uuidString, forKey: "selectedVoiceID") }
+        else { defaults.removeObject(forKey: "selectedVoiceID") }
     }
 
     func toggleRecording() {
@@ -290,8 +365,9 @@ import IrodoriTTS
             #endif
             guard let url = recordingURL else { return }
             do { _ = try ReferenceAudio.read(url)
-                ready = false
-                referencePath = url.path; UserDefaults.standard.set(url.path, forKey: "referencePath")
+                let formatter = DateFormatter()
+                formatter.dateFormat = "M/d HH:mm"
+                addVoice(file: url, name: "録音 \(formatter.string(from: Date()))")
                 status = "録音を登録しました。"
             } catch { try? FileManager.default.removeItem(at: url); report(error) }
             return
