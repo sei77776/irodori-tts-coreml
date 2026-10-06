@@ -1,0 +1,64 @@
+{
+ "format": 1,
+ "voices": [
+  {
+   "id": 0,
+   "name": "話者 #0",
+   "file": "voice_000.bin"
+  },
+  {
+   "id": 83,
+   "name": "話者 #83",
+   "file": "voice_083.bin"
+  },
+  {
+   "id": 101,
+   "name": "話者 #101",
+   "file": "voice_101.bin"
+  },
+  {
+   "id": 77,
+   "name": "話者 #77",
+   "file": "voice_077.bin"
+  },
+  {
+   "id": 35,
+   "name": "話者 #35",
+   "file": "voice_035.bin"
+  }
+ ],
+ "common": {
+  "file": "common.bin",
+  "ir_window": 512,
+  "formant_shift": [
+   9,
+   256
+  ]
+ },
+ "voice_layout": {
+  "spk_embed": 256,
+  "kv": [
+   384,
+   128
+  ],
+  "codebook": [
+   512,
+   128
+  ]
+ },
+ "functions": {
+  "w64": 64,
+  "w116": 116,
+  "w216": 216
+ },
+ "lookahead_frames": 4,
+ "crossfade_frames": 2,
+ "models": {
+  "fp32": "BeatriceFP32.mlpackage",
+  "mixed": "BeatriceMixed.mlpackage"
+ },
+ "credits": [
+  "Voice conversion model: Beatrice v2 (beatrice-trainer 2.0.0-rc.0, fierce-cats, MIT License)",
+  "Pretrained speakers: trained on LibriTTS-R (CC BY 4.0) and other corpora listed in beatrice-trainer assets/README.md"
+ ]
+}

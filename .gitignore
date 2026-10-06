@@ -24,3 +24,6 @@ __pycache__/
 *.app/
 .env
 .env.*
+# Beatrice real-time voice conversion prototype: bundled models and test references
+!Examples/BeatriceAssets/*.mlpackage/
+!Tests/BeatriceVCTests/Golden/*.f32

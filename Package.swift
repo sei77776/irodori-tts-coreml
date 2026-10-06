@@ -5,7 +5,9 @@ let package = Package(
     name: "IrodoriTTS",
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
-        .library(name: "IrodoriTTS", targets: ["IrodoriTTS"]),
+        // BeatriceVC (experimental real-time voice conversion) ships in the same product so the
+        // sample app can import it without another package product reference.
+        .library(name: "IrodoriTTS", targets: ["IrodoriTTS", "BeatriceVC"]),
         .executable(name: "irodori", targets: ["IrodoriCLI"]),
     ],
     targets: [
@@ -16,7 +18,12 @@ let package = Package(
         .target(name: "IrodoriTTS", dependencies: ["IrodoriNative"],
                 linkerSettings: [.linkedFramework("AVFoundation")]),
         .executableTarget(name: "IrodoriCLI", dependencies: ["IrodoriTTS"]),
+        .target(name: "BeatriceVC",
+                linkerSettings: [.linkedFramework("AVFoundation"), .linkedFramework("CoreML"),
+                                 .linkedFramework("Accelerate")]),
         .testTarget(name: "IrodoriTTSTests", dependencies: ["IrodoriTTS"]),
+        .testTarget(name: "BeatriceVCTests", dependencies: ["BeatriceVC"],
+                    resources: [.copy("Golden")]),
     ],
     cxxLanguageStandard: .cxx17
 )
