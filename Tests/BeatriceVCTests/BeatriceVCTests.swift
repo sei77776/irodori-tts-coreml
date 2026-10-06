@@ -23,10 +23,20 @@ class BeatriceVCTests: XCTestCase {
         var stream: Stream
     }
 
-    static let golden: URL = Bundle.module.url(forResource: "Golden", withExtension: nil)!
-    static let assetsDir = URL(fileURLWithPath: #filePath)
+    /// Golden data folder (test resource) and voice-pack directory under Examples/BeatriceAssets;
+    /// subclasses override these to run the same checks on another pack.
+    class var goldenName: String { "Golden" }
+    class var packSubdirectory: String? { nil }
+    /// prefix of the BEATRICE_RESULT keys ("" for the pretrained pack)
+    class var resultPrefix: String { "" }
+
+    static let assetsRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         .appendingPathComponent("Examples/BeatriceAssets")
+    class var golden: URL { Bundle.module.url(forResource: goldenName, withExtension: nil)! }
+    class var assetsDir: URL {
+        packSubdirectory.map { assetsRoot.appendingPathComponent($0) } ?? assetsRoot
+    }
 
     func meta() throws -> Meta {
         try JSONDecoder().decode(Meta.self, from: Data(contentsOf: Self.golden.appendingPathComponent("meta.json")))
@@ -48,7 +58,7 @@ class BeatriceVCTests: XCTestCase {
     }
 
     func report(_ key: String, _ value: Double) {
-        print(String(format: "BEATRICE_RESULT %@=%.3f", key, value))
+        print(String(format: "BEATRICE_RESULT %@%@=%.3f", Self.resultPrefix, key, value))
     }
 
     // MARK: - FFT
@@ -134,6 +144,7 @@ class BeatriceVCTests: XCTestCase {
         guard #available(macOS 15.0, iOS 18.0, *) else { throw XCTSkip("multifunction Core ML needs macOS 15") }
         let m = try meta()
         let assets = try BeatriceAssets(directory: Self.assetsDir)
+        if assets.manifest.models[key] == nil { throw XCTSkip("model \(key) is not shipped in this pack") }
         let url = try XCTUnwrap(assets.modelURL(key), "model \(key) missing")
         let t0 = Date()
         let model = try BeatriceModel(package: url, function: "w\(m.W)", window: m.W, computeUnits: units)
@@ -243,4 +254,57 @@ class BeatriceVCTests: XCTestCase {
         report("engine_rendered_rms", sqrt(energy))
         XCTAssertGreaterThan(energy, 1e-6)
     }
+}
+
+/// Pack discovery and the compiled-model cache key (no Core ML execution needed).
+final class BeatriceVoicePackTests: XCTestCase {
+    func testPacksAreDiscoveredInOrder() throws {
+        let packs = try BeatriceVoicePacks(root: BeatriceVCTests.assetsRoot)
+        XCTAssertTrue(packs.errors.isEmpty, packs.errors.joined(separator: "; "))
+        let ids = packs.packs.map(\.pack.id)
+        XCTAssertEqual(ids, ["tsukuyomi", "pretrained"])
+        XCTAssertEqual(packs.entries.first?.voice.name, "つくよみちゃん")
+        XCTAssertEqual(packs.entries.count, 6)
+        // voice ids repeat across packs; keys must not
+        XCTAssertEqual(Set(packs.entries.map(\.key)).count, packs.entries.count)
+        let tsukuyomi = try XCTUnwrap(packs.assets(for: .init(pack: "tsukuyomi", voice: 0)))
+        let credit = (tsukuyomi.pack.voiceCredit ?? []).joined(separator: "\n")
+        XCTAssertTrue(credit.contains("つくよみちゃんコーパス（CV.夢前黎）"))
+        XCTAssertTrue(credit.contains("https://tyc.rei-yumesaki.net/material/corpus/"))
+        XCTAssertFalse((tsukuyomi.pack.terms ?? []).isEmpty)
+        for a in packs.packs {
+            XCTAssertNotNil(a.modelURL("fp32"), a.pack.id)
+            let voice = try a.loadVoice(try XCTUnwrap(a.manifest.voices.first))
+            XCTAssertEqual(voice.codebook.count, 512 * 128)
+        }
+    }
+
+    func testCompiledModelCacheKeyDiffersBetweenPacks() throws {
+        let packs = try BeatriceVoicePacks(root: BeatriceVCTests.assetsRoot)
+        let urls = packs.packs.compactMap { $0.modelURL("fp32") }
+        XCTAssertEqual(urls.count, 2)
+        let hashes = try urls.map { try BeatriceModel.contentHash($0) }
+        print("BEATRICE_RESULT fp32_package_bytes_equal=\(BeatriceModelSizes.size(urls[0]) == BeatriceModelSizes.size(urls[1]) ? 1 : 0)")
+        XCTAssertNotEqual(hashes[0], hashes[1])
+        XCTAssertEqual(try BeatriceModel.contentHash(urls[0]), hashes[0])
+    }
+}
+
+enum BeatriceModelSizes {
+    static func size(_ url: URL) -> Int {
+        guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total = 0
+        for case let f as URL in e { total += (try? f.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0 }
+        return total
+    }
+}
+
+/// The same golden checks on the fine-tuned つくよみちゃん pack (Examples/BeatriceAssets/tsukuyomi,
+/// reference data in GoldenTsukuyomi written by export_ios_assets.py from the PyTorch model).
+final class BeatriceTsukuyomiTests: BeatriceVCTests {
+    override class var goldenName: String { "GoldenTsukuyomi" }
+    override class var packSubdirectory: String? { "tsukuyomi" }
+    override class var resultPrefix: String { "tsukuyomi_" }
+    // pack-independent
+    override func testRealFFTMatchesNaiveDFT() throws {}
 }

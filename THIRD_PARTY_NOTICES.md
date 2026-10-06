@@ -46,3 +46,11 @@ Conversion-only dependencies are installed separately. Their licenses include
 [onnx2torch Apache-2.0](https://github.com/ENOT-AutoDL/onnx2torch/blob/main/LICENSE)
 and the respective PyTorch, NumPy, ONNX and Transformers licenses. Those tools
 are not redistributed as vendored code or environments in this repository.
+
+## Real-time voice changer (BeatriceVC, sample app)
+
+| Component | Source and attribution | Declared license / included text |
+|---|---|---|
+| Beatrice v2 model definition and pretrained weights | [fierce-cats/beatrice-trainer](https://huggingface.co/fierce-cats/beatrice-trainer) 2.0.0-rc.0 | MIT |
+| "標準" voices (`Examples/BeatriceAssets/`) | Speakers of the pretrained model, trained on LibriTTS-R and other corpora listed in beatrice-trainer `assets/README.md` | LibriTTS-R: CC BY 4.0 |
+| "つくよみちゃん" voice (`Examples/BeatriceAssets/tsukuyomi/`) | Pretrained model fine-tuned on the [つくよみちゃんコーパス](https://tyc.rei-yumesaki.net/material/corpus/) (CV.夢前黎). Required credit: 本ソフトウェアの音声合成には、フリー素材キャラクター「つくよみちゃん」（© Rei Yumesaki）が無料公開している音声データを使用しています。■つくよみちゃんコーパス（CV.夢前黎） https://tyc.rei-yumesaki.net/material/corpus/ | Tsukuyomi-chan corpus terms (commercial use allowed with the credit above; prohibited uses of the output are listed in `Examples/BeatriceAssets/tsukuyomi/README.md` and in the app). No corpus audio is redistributed. |

@@ -1,4 +1,5 @@
 import CoreML
+import CryptoKit
 import Foundation
 
 public enum BeatriceComputeUnits: String, CaseIterable, Identifiable, Sendable {
@@ -46,27 +47,70 @@ public final class BeatriceModel {
     }
 
     /// Compiles the .mlpackage once and caches the .mlmodelc under Caches/BeatriceCompiled.
+    /// The cache key is the package name plus a SHA-256 of its contents: packs exported from
+    /// different checkpoints have byte-identical sizes, so a size-based key would hand one pack
+    /// the other pack's compiled model. Older compiled copies of the same package are removed.
     public static func compiledModel(for package: URL) throws -> URL {
         let fm = FileManager.default
         let caches = try fm.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("BeatriceCompiled", isDirectory: true)
         try fm.createDirectory(at: caches, withIntermediateDirectories: true)
-        let key = "\(package.deletingPathExtension().lastPathComponent)-\(directorySize(package))"
+        let name = package.deletingPathExtension().lastPathComponent
+        let key = "\(name)-\(try contentHash(package))"
         let target = caches.appendingPathComponent(key + ".mlmodelc", isDirectory: true)
         if fm.fileExists(atPath: target.path) { return target }
         let temp = try MLModel.compileModel(at: package)
-        try? fm.removeItem(at: target)
-        try fm.moveItem(at: temp, to: target)
+        do {
+            try fm.moveItem(at: temp, to: target)
+        } catch {
+            guard fm.fileExists(atPath: target.path) else { throw error }
+            try? fm.removeItem(at: temp) // compiled concurrently by another caller
+        }
+        // legacy "<name>-<size>.mlmodelc" entries (pre-pack builds) are never reused
+        for old in (try? fm.contentsOfDirectory(atPath: caches.path)) ?? []
+        where old.hasPrefix(name + "-") && old.hasSuffix(".mlmodelc") && Int(old.dropFirst(name.count + 1).dropLast(9)) != nil {
+            try? fm.removeItem(at: caches.appendingPathComponent(old))
+        }
         return target
     }
 
-    static func directorySize(_ url: URL) -> Int {
-        guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
-        var total = 0
-        for case let file as URL in e {
-            total += (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+    private final class HashCache: @unchecked Sendable {
+        let lock = NSLock()
+        var values: [String: String] = [:]
+    }
+    private static let hashCache = HashCache()
+
+    /// SHA-256 (first 16 bytes, hex) over the package's relative paths and file contents,
+    /// memoized per path for the life of the process.
+    static func contentHash(_ package: URL) throws -> String {
+        let path = package.standardizedFileURL.path
+        let cache = hashCache
+        cache.lock.lock()
+        if let h = cache.values[path] { cache.lock.unlock(); return h }
+        cache.lock.unlock()
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: package, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            throw BeatriceError.missingFile(package.path)
         }
-        return total
+        var files: [URL] = []
+        for case let f as URL in e where (try? f.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+            files.append(f)
+        }
+        let base = package.standardizedFileURL.resolvingSymlinksInPath().path
+        func rel(_ u: URL) -> String {
+            let p = u.standardizedFileURL.resolvingSymlinksInPath().path
+            return p.hasPrefix(base) ? String(p.dropFirst(base.count)) : u.lastPathComponent
+        }
+        var hasher = SHA256()
+        for f in files.sorted(by: { rel($0) < rel($1) }) {
+            hasher.update(data: Data(rel(f).utf8))
+            guard let h = FileHandle(forReadingAtPath: f.path) else { throw BeatriceError.missingFile(f.path) }
+            defer { try? h.close() }
+            while let chunk = try h.read(upToCount: 1 << 20), !chunk.isEmpty { hasher.update(data: chunk) }
+        }
+        let h = hasher.finalize().prefix(16).map { String(format: "%02x", $0) }.joined()
+        cache.lock.lock(); cache.values[path] = h; cache.lock.unlock()
+        return h
     }
 
     public func setSpeaker(embedding: [Float], keyValue: [Float], codebook: [Float]) throws {

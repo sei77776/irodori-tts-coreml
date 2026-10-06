@@ -4,7 +4,7 @@ import XCTest
 
 /// Noise gate / high-pass behaviour and the audio I/O data path (sample-rate conversion, ring
 /// buffers, render callbacks) at realistic callback sizes. Numbers are printed as BEATRICE_RESULT.
-final class BeatriceNoiseAndIOTests: BeatriceVCTests {
+class BeatriceNoiseAndIOTests: BeatriceVCTests {
     // Keep the inherited tests from running twice.
     override func testRealFFTMatchesNaiveDFT() throws {}
     override func testNoiseMatchesPython() throws {}
@@ -271,5 +271,40 @@ final class BeatriceNoiseAndIOTests: BeatriceVCTests {
         let voiced = pitches.filter { 96 * log2($0 / 55) > 24.5 }.sorted()
         report("quiet_speech_minus30db_voiced_percent", 100 * Double(voiced.count) / Double(max(1, pitches.count)))
         report("quiet_speech_minus30db_pitch_median_hz", Double(voiced.isEmpty ? 0 : voiced[voiced.count / 2]))
+    }
+}
+
+/// Gate, output high-pass and noise-pitch ("buzz") suppression on the つくよみちゃん pack. The pitch
+/// estimator is the pretrained one (bit-identical in the fine-tuned checkpoint), so noise still
+/// maps to the lowest pitch bins; the suppression must keep working with the fine-tuned vocoder.
+final class BeatriceTsukuyomiNoiseTests: BeatriceNoiseAndIOTests {
+    override class var goldenName: String { "GoldenTsukuyomi" }
+    override class var packSubdirectory: String? { "tsukuyomi" }
+    override class var resultPrefix: String { "tsukuyomi_" }
+    // pack-independent (audio I/O, filters): covered by BeatriceNoiseAndIOTests
+    override func testHighPassFilters() {}
+    override func testGateGainIsSmooth() {}
+    override func testIOCallbackSizesAndRates() throws {}
+    override func testInputChannelExtraction() throws {}
+
+    func testNoiseOnlyInputIsQuietWithBuzzSuppression() throws {
+        let (plain, masked) = try makeStreamer()
+        masked.noisePitchMaxBin = 24
+        var rng = SystemRandomNumberGenerator()
+        let count = 24 * plain.inputChunkSamples
+        for noiseDB in [-60.0, -50.0] {
+            let amp = Float(pow(10, noiseDB / 20) * 3.0.squareRoot())
+            let noise = (0..<count).map { _ in Float.random(in: -1...1, using: &rng) * amp }
+            plain.reset(); masked.reset()
+            let a = try run(plain, noise), b = try run(masked, noise)
+            let plainDB = db(rms(a[2400...])), maskedDB = db(rms(b[2400...]))
+            report("noiseonly\(Int(-noiseDB))_plain_db", plainDB)
+            report("noiseonly\(Int(-noiseDB))_suppressed_db", maskedDB)
+            // PyTorch reference (same algorithm, seeded noise): plain −96.7 / −96.7 dBFS, suppressed
+            // −104.9 / −99.9 dBFS for −60 / −50 dBFS noise. The fine-tuned vocoder hardly buzzes;
+            // the pretrained pack gives −62 / −55 dBFS plain under the same test.
+            XCTAssertLessThan(maskedDB, -70, "noise \(noiseDB) dB: output not quiet")
+            XCTAssertLessThanOrEqual(maskedDB, plainDB + 1, "noise \(noiseDB) dB: suppression made it louder")
+        }
     }
 }

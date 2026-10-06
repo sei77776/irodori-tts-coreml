@@ -23,7 +23,7 @@ let package = Package(
                                  .linkedFramework("Accelerate")]),
         .testTarget(name: "IrodoriTTSTests", dependencies: ["IrodoriTTS"]),
         .testTarget(name: "BeatriceVCTests", dependencies: ["BeatriceVC"],
-                    resources: [.copy("Golden")]),
+                    resources: [.copy("Golden"), .copy("GoldenTsukuyomi")]),
     ],
     cxxLanguageStandard: .cxx17
 )
