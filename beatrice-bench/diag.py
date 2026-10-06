@@ -26,8 +26,8 @@ from coreml_wrap import StreamNN  # noqa: E402
 import coremltools as ct  # noqa: E402
 
 STAGES = ["inst", "corr", "energy_raw", "phone_raw", "phone_vq", "phone_norm", "pitch_logits", "pitch_softmax",
-          "qp", "pitch_feats", "pitch_hz", "h", "prenet", "ir_amp", "ir_phase", "aperiodicity", "post_filter"]
-INT_STAGES = {"qp"}
+          "qp", "pitch_feats", "qpf", "expo", "pow_raw", "pitch_hz", "h", "prenet", "ir_amp", "ir_phase", "aperiodicity", "post_filter"]
+INT_STAGES = {"qp", "qpf"}
 
 
 class DebugNN(StreamNN):
@@ -43,7 +43,9 @@ class DebugNN(StreamNN):
         logits = ps.head(ps.backbone(F.gelu(a + b, approximate="tanh")))
         qp, pf = self.sample_pitch(logits)
         qpf = torch.where(qp == 0, qp, torch.clamp(qp + pitch_shift_bins, 1.0, 447.0))
-        pitch_hz = 55.0 * torch.pow(2.0, qpf / 96.0)
+        expo = qpf / 96.0
+        pow_raw = torch.pow(2.0, expo)
+        pitch_hz = 55.0 * pow_raw
         energy = torch.cat([en[:, :, 1:2], en[:, :, :-1]], 2)
         qpf_d = torch.cat([qpf[:, 2:3], qpf[:, 1:2], qpf[:, :-2]], 1)
         pf2 = torch.cat([pf[:, :, 2:3], pf[:, :, 1:2], pf[:, :, :-2]], 2)
@@ -53,7 +55,7 @@ class DebugNN(StreamNN):
         h = F.silu(h)
         x = g.vocoder.prenet(h, kv)
         o = vocoder_nn(g.vocoder, h, kv)
-        return (inst, cd, en, phone_raw, phone_vq, phone, logits, logits.softmax(1), qp, pf, pitch_hz, h, x,
+        return (inst, cd, en, phone_raw, phone_vq, phone, logits, logits.softmax(1), qp, pf, qpf, expo, pow_raw, pitch_hz, h, x,
                 o["ir_amp"], o["ir_phase"], o["aperiodicity"], o["post_filter"])
 
 
@@ -150,7 +152,7 @@ def op_tests(mdir, can_run):
     return tests
 
 
-def run(pe, ps, g, se, kv, cb, out_dir, W=60, can_run=True):
+def run(pe, ps, g, se, kv, cb, out_dir, W=60, can_run=True, precs=("fp32",)):
     mdir = os.path.join(out_dir, "models_diag"); os.makedirs(mdir, exist_ok=True)
     rep = {"W": W, "stages": {}, "ops": {}, "errors": []}
     wav, sr = sf.read(os.path.join(REPO, "assets/test/common_voice_ja_38843402_16k.wav"), dtype="float32")
@@ -166,6 +168,8 @@ def run(pe, ps, g, se, kv, cb, out_dir, W=60, can_run=True):
     shapes = [tuple(xs[0].shape), (1, 256), (1, 384, 128), (1, 512, 128), (1,)]
     sp = {"spk_embed": se.numpy(), "kv": kv.numpy(), "codebook": cb.numpy(), "pitch_shift_bins": np.zeros((1,), np.float32)}
     for prec_name, prec in [("fp32", ct.precision.FLOAT32), ("fp16", ct.precision.FLOAT16)]:
+        if prec_name not in precs:
+            continue
         try:
             t0 = time.time()
             path = convert(tr, names, shapes, STAGES, prec, os.path.join(mdir, f"debug_{prec_name}_W{W}.mlpackage"))

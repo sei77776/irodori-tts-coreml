@@ -203,3 +203,148 @@ def speaker_inputs(g, spk, formant=0.0):
     kv = g.key_value_speaker_embedding.weight[spk].view(1, 384, 128)
     cb = g.vq.codebooks[spk].float()[None]
     return se, kv, cb
+
+
+class StreamNNv2(StreamNN):
+    """'safe' graph with (1) pitch_hz from a lookup table instead of pow, plus qp as an extra output,
+    (2) VQ and sample_pitch written one op per line with names prefixed `k32_`, so that a
+    Core ML FP16 conversion can keep exactly these ops in FP32 (see keep_fp32_selector)."""
+
+    def __init__(self, pe, ps, g):
+        super().__init__(pe, ps, g, "safe")
+        self.register_buffer("pitch_table", 55.0 * torch.pow(2.0, torch.arange(448, dtype=torch.float64) / 96.0).float()[:, None])
+
+    def vq(self, x, codebook):
+        k32a_x2 = x * x
+        k32a_n2 = k32a_x2.sum(1, keepdim=True)
+        k32a_n = torch.sqrt(k32a_n2)
+        k32a_nc = torch.clamp(k32a_n, min=1e-6)
+        k32a_q = x / k32a_nc
+        k32a_sim = torch.einsum("bcl,bkc->blk", k32a_q, codebook)
+        k32a_top = k32a_sim.topk(4, dim=-1)
+        k32a_idx = k32a_top[1]
+        k32a_oh = F.one_hot(k32a_idx, 512).float()
+        k32a_ohs = k32a_oh.sum(2)
+        k32a_w = k32a_ohs * 0.25
+        k32a_g = k32a_w @ codebook
+        return k32a_g.transpose(1, 2)
+
+    def sample_pitch(self, logits):
+        k32b_p = logits.softmax(1)
+        k32b_unv = k32b_p[:, :1]
+        k32b_m = torch.full_like(k32b_p[:, :1], -100.0)
+        k32b_p2 = torch.cat([k32b_m, k32b_p[:, 1:]], 1)
+        k32b_b01 = k32b_p2[:, :-3] + k32b_p2[:, 1:-2]
+        k32b_b23 = k32b_p2[:, 2:-1] + k32b_p2[:, 3:]
+        k32b_band = k32b_b01 + k32b_b23
+        ids = self.pitch_ids[None, :, None]
+        bids = ids[:, :445]
+        k32b_qbi = k32b_band.argmax(1, keepdim=True)
+        k32b_qb = k32b_qbi.float()
+        k32b_eq0 = (bids == k32b_qb).float()
+        k32b_bpm = k32b_band * k32b_eq0
+        k32b_bp = k32b_bpm.sum(1, keepdim=True)
+        k32b_hi = torch.clamp(k32b_qb - 96.0, min=1.0)
+        k32b_eq1 = (bids == k32b_hi).float()
+        k32b_hm = k32b_band * k32b_eq1
+        k32b_hs = k32b_hm.sum(1, keepdim=True)
+        k32b_hv = (k32b_qb > 96.0).float()
+        k32b_half = k32b_hs * k32b_hv
+        k32b_di = torch.clamp(k32b_qb + 96.0, max=444.0)
+        k32b_eq2 = (bids == k32b_di).float()
+        k32b_dm = k32b_band * k32b_eq2
+        k32b_ds = k32b_dm.sum(1, keepdim=True)
+        k32b_dv = (k32b_qb <= 348.0).float()
+        k32b_dbl = k32b_ds * k32b_dv
+        k32b_lo = ids >= k32b_qb
+        k32b_up = ids < k32b_qb + 4.0
+        k32b_mask = (k32b_lo & k32b_up).float()
+        k32b_pm = k32b_p2 * k32b_mask
+        k32b_qpi = k32b_pm.argmax(1)
+        k32b_qp = k32b_qpi.float()
+        k32b_bpe = k32b_bp + 1e-6
+        k32b_hr = k32b_half / k32b_bpe
+        k32b_dr = k32b_dbl / k32b_bpe
+        k32b_feats = torch.cat([k32b_unv, k32b_hr, k32b_dr], 1)
+        return k32b_qp, k32b_feats
+
+    def forward(self, wav, spk_embed, kv, codebook, pitch_shift_bins):
+        o = self.forward_pf(wav, None, None, None, spk_embed, kv, codebook, pitch_shift_bins)
+        return o
+
+    def forward_pf(self, wav, inst, corr, energy, spk_embed, kv, codebook, pitch_shift_bins, phone_raw=None):
+        g = self.g
+        if phone_raw is None:
+            phone_raw = self.phone(wav)
+        phone = self.vq(phone_raw, codebook)
+        phone = phone * torch.rsqrt((phone * phone).mean(1, keepdim=True) + 1.1920928955078125e-07)
+        if inst is None:
+            logits, energy = self.pitch(wav)
+        else:
+            p = self.ps
+            a = p.instfreq_embed_1(F.gelu(p.instfreq_embed_0(inst), approximate="tanh"))
+            b = p.corr_embed_1(F.gelu(p.corr_embed_0(corr), approximate="tanh"))
+            logits = p.head(p.backbone(F.gelu(a + b, approximate="tanh")))
+        qp, pf = self.sample_pitch(logits)
+        k32c_qs = torch.clamp(qp + pitch_shift_bins, 1.0, 447.0)
+        k32c_qpf = torch.where(qp == 0, qp, k32c_qs)
+        k32c_ohp = (k32c_qpf[:, :, None] == self.pitch_ids[None, None, :]).float()
+        k32c_hz2 = k32c_ohp @ self.pitch_table  # [1,L,1]
+        k32c_hz = k32c_hz2[:, :, 0]
+        energy = torch.cat([energy[:, :, 1:2], energy[:, :, :-1]], 2)
+        qpf_d = torch.cat([k32c_qpf[:, 2:3], k32c_qpf[:, 1:2], k32c_qpf[:, :-2]], 1)
+        pf = torch.cat([pf[:, :, 2:3], pf[:, :, 1:2], pf[:, :, :-2]], 2)
+        pf = torch.cat([energy, pf], 1)
+        emb_p = (qpf_d[:, :, None] == self.pitch_ids[None, None, :]).float() @ g.embed_quantized_pitch.weight
+        h = g.embed_phone(phone) + emb_p.transpose(1, 2) + g.embed_pitch_features(pf) + spk_embed[:, :, None]
+        h = F.silu(h)
+        o = vocoder_nn(g.vocoder, h, kv)
+        return o["ir_amp"], o["ir_phase"], o["aperiodicity"], o["post_filter"], k32c_hz, k32c_qpf
+
+
+def make_fp32_selector(regions=("vq", "sp", "hz")):
+    """op_selector for ct.transform.FP16ComputePrecision (True = make this op FP16).
+    Regions are delimited by marker op names (k32a_ = VQ, k32b_ = sample_pitch, k32c_ = pitch_hz);
+    an op is kept FP32 if it lies between the first and last marker of a selected region in the
+    block's op order (trace order). "phone" = every op before the first VQ marker (the phone
+    extractor, which runs first in the graph)."""
+    pref = {"vq": "k32a_", "sp": "k32b_", "hz": "k32c_"}
+    # "pnet": the pitch-estimator network = ops between the last VQ marker and the first sample_pitch marker
+
+    def names(op):
+        return [op.name] + [o.name for o in op.outputs]
+
+    cache = {}
+
+    def ranges(block):
+        ops = block.operations
+        key = (id(block), len(ops))
+        if key not in cache:
+            cache.clear()
+            pos = {id(o): i for i, o in enumerate(ops)}
+            rr = []
+            for r in regions:
+                if r == "phone":
+                    first_vq = next((i for i, o in enumerate(ops) if any(n.startswith("k32a_") for n in names(o))), None)
+                    if first_vq is not None:
+                        rr.append((0, first_vq - 1))
+                    continue
+                if r == "pnet":
+                    a_ = [i for i, o in enumerate(ops) if any(n.startswith("k32a_") for n in names(o))]
+                    b_ = [i for i, o in enumerate(ops) if any(n.startswith("k32b_") for n in names(o))]
+                    if a_ and b_:
+                        rr.append((a_[-1] + 1, b_[0] - 1))
+                    continue
+                idx = [i for i, o in enumerate(ops) if any(n.startswith(pref[r]) for n in names(o))]
+                if idx:
+                    rr.append((idx[0], idx[-1]))
+            cache[key] = (pos, rr)
+        return cache[key]
+
+    def sel(op):
+        pos, rr = ranges(op.enclosing_block)
+        me = pos.get(id(op))
+        if me is None:
+            return True
+        return not any(lo <= me <= hi for lo, hi in rr)
+    return sel
