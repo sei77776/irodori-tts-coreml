@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import CryptoKit
+import Speech
 import IrodoriTTS
 
 /// A registered reference voice. Only the file name is persisted; files live in the app's References folder.
@@ -8,6 +9,64 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     let id: UUID
     var name: String
     let fileName: String
+}
+
+/// Combined output of one request, which may span several synthesize calls (one per tone segment).
+struct SpeechOutput {
+    let pcm16: Data
+    let synthesisMilliseconds: Double
+    let firstPCMMilliseconds: Double
+    var audioSeconds: Double { Double(pcm16.count) / 96_000 }
+    var rtf: Double { synthesisMilliseconds / 1000 / max(audioSeconds, 0.000001) }
+}
+
+/// Tone read from sentence-final punctuation, used to add a style instruction per sentence.
+enum SentenceTone: Equatable {
+    case neutral, emphatic, excited, question
+
+    var instruction: String {
+        switch self {
+        case .neutral: return ""
+        case .emphatic: return "感情を込めて、はっきりと力強く話す。"
+        case .excited: return "とても興奮して、大きな声で勢いよく話す。"
+        case .question: return "問いかけるように、語尾を上げて話す。"
+        }
+    }
+
+    /// Splits text after 。！？!? or a newline and merges neighbouring sentences with the same tone.
+    static func segments(of text: String) -> [(text: String, tone: SentenceTone)] {
+        var sentences: [String] = []
+        var current = ""
+        var previousWasEnd = false
+        for character in text {
+            let isEnd = "。！？!?\n".contains(character)
+            if previousWasEnd && !isEnd {
+                sentences.append(current); current = ""
+            }
+            current.append(character)
+            previousWasEnd = isEnd
+        }
+        sentences.append(current)
+        var result: [(text: String, tone: SentenceTone)] = []
+        for sentence in sentences where !sentence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let tone = classify(sentence)
+            if let last = result.last, last.tone == tone {
+                result[result.count - 1].text += sentence
+            } else {
+                result.append((sentence, tone))
+            }
+        }
+        return result
+    }
+
+    static func classify(_ sentence: String) -> SentenceTone {
+        let trailing = sentence.trimmingCharacters(in: .whitespacesAndNewlines).reversed().prefix { "。！？!?".contains($0) }
+        let exclamations = trailing.filter { "！!".contains($0) }.count
+        if exclamations >= 2 { return .excited }
+        if exclamations == 1 { return .emphatic }
+        if trailing.contains(where: { "？?".contains($0) }) { return .question }
+        return .neutral
+    }
 }
 
 @MainActor final class SampleModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
@@ -26,7 +85,11 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     @Published var consent = false
     @Published var outputURL: URL?
     private let engine = IrodoriEngine()
-    @Published var result: SynthesisResult?
+    @Published var result: SpeechOutput?
+    /// Adds a per-sentence style instruction from ！ / ？ so exclamations are not read flatly.
+    @Published var autoTone = UserDefaults.standard.object(forKey: "autoTone") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(autoTone, forKey: "autoTone") }
+    }
     @Published var errorMessage: String?
     @Published var ready = false
     @Published var modelPreparationMilliseconds: Double?
@@ -41,6 +104,19 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     private var recordingURL: URL?
     private var task: Task<Void, Never>?
     private let store: URL
+    // Generate-and-play: chunks are played while later sentences are still being synthesized.
+    private var streamPlayer: PCMPlayer?
+    private var streamID: UUID?
+    // Speak-to-convert mode: on-device speech recognition → synthesis in the selected voice.
+    @Published var relayActive = false
+    @Published var heardText = ""
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
+    private let micEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var silenceTimer: Timer?
+    /// Silence after the last recognized words that ends an utterance.
+    private let endOfSpeechDelay: TimeInterval = 0.7
 
     override init() {
         store = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -51,6 +127,10 @@ struct SavedVoice: Codable, Identifiable, Hashable {
         if !modelPath.isEmpty && !FileManager.default.fileExists(atPath: modelPath) {
             let replacement = store.appendingPathComponent("Models/\(URL(fileURLWithPath: modelPath).lastPathComponent)")
             if FileManager.default.fileExists(atPath: replacement.path) { modelPath = replacement.path }
+        }
+        if !modelPath.isEmpty {
+            // Load Core ML and run one short synthesis at launch so the first real request is not the slow one.
+            Task { @MainActor in self.warmUp() }
         }
         if !modelPath.isEmpty {
             status = referencePath.isEmpty
@@ -65,7 +145,7 @@ struct SavedVoice: Codable, Identifiable, Hashable {
         errorMessage = nil
         busy = true
         task = Task {
-            defer { busy = false; task = nil }
+            defer { busy = false; task = nil; resumeListeningIfIdle() }
             do { try await body() }
             catch is CancellationError { status = "停止しました。" }
             catch { report(error) }
@@ -148,26 +228,88 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     }
 
     func speak() {
+        work { try await self.synthesizeAndStream() }
+    }
+
+    func warmUp() {
+        guard !modelPath.isEmpty else { return }
         work {
-            self.stopPlayback()
-            try await self.prepareEngine()
+            self.status = "起動時の準備をしています…（初回は時間がかかることがあります）"
+            let load = try await self.engine.prepare(modelDirectory: URL(fileURLWithPath: self.modelPath))
+            try await self.engine.registerReference(nil)
             try Task.checkCancellation()
-            self.status = "音声を生成しています…"
-            // One sanitized input, one utterance. Playback begins only after the WAV is complete.
-            let result = try await self.engine.synthesize(self.text, caption: self.caption, splitSentences: false)
-            try Task.checkCancellation()
-            let url = self.store.appendingPathComponent("generated.wav")
-            try result.writeWAV(to: url); self.outputURL = url
-            self.statistics += String(format: "\nRTF %.3f / 最初のPCM %.0f ms / 音声 %.2f 秒", result.rtf, result.firstPCMMilliseconds, result.audioSeconds)
-            self.result = result
-            self.waveform = Self.envelope(result.pcm16)
-            self.playbackPosition = 0
-            try self.startPlayback()
+            _ = try await self.engine.synthesize("こんにちは。", caption: self.caption, splitSentences: true)
+            self.modelPreparationMilliseconds = load
+            self.ready = self.selectedVoice == nil
+            self.status = "準備できました。"
         }
+    }
+
+    /// Synthesizes sentence by sentence and plays each PCM chunk as soon as it arrives.
+    private func synthesizeAndStream() async throws {
+        stopPlayback()
+        try await prepareEngine()
+        try Task.checkCancellation()
+        status = "音声を生成しています…"
+        let player = PCMPlayer(managesSession: !relayActive)
+        let id = UUID()
+        streamPlayer = player; streamID = id
+        player.onFinished = { [weak self] in self?.streamDidFinish(id) }
+        isPlaying = true
+        let onChunk: @Sendable (PCMChunk) -> Void = { [weak self] chunk in
+            // Main queue keeps chunk order; stale chunks from a stopped request are dropped.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.streamID == id else { return }
+                    do { try player.append(chunk.pcm16) }
+                    catch { self.stopPlayback(); self.report(error) }
+                }
+            }
+        }
+        let userCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+        let segments = autoTone ? SentenceTone.segments(of: text) : [(text: text, tone: SentenceTone.neutral)]
+        var pcm = Data()
+        var synthesisMilliseconds = 0.0
+        var firstPCMMilliseconds: Double?
+        for segment in segments where segment.text.range(of: #"[\p{L}\p{N}]"#, options: .regularExpression) != nil {
+            try Task.checkCancellation()
+            let segmentCaption = [userCaption, segment.tone.instruction].filter { !$0.isEmpty }.joined(separator: " ")
+            let part = try await engine.synthesize(segment.text, caption: segmentCaption, splitSentences: true, onChunk: onChunk)
+            if firstPCMMilliseconds == nil { firstPCMMilliseconds = synthesisMilliseconds + part.firstPCMMilliseconds }
+            synthesisMilliseconds += part.synthesisMilliseconds
+            pcm.append(part.pcm16)
+        }
+        let result = SpeechOutput(pcm16: pcm, synthesisMilliseconds: synthesisMilliseconds,
+                                  firstPCMMilliseconds: firstPCMMilliseconds ?? 0)
+        try Task.checkCancellation()
+        let url = store.appendingPathComponent("generated.wav")
+        try ReferenceAudio.writeWAV(pcm16: result.pcm16, to: url); outputURL = url
+        statistics += String(format: "\nRTF %.3f / 最初のPCM %.0f ms / 音声 %.2f 秒", result.rtf, result.firstPCMMilliseconds, result.audioSeconds)
+        self.result = result
+        waveform = Self.envelope(result.pcm16)
+        playbackPosition = 0
+        // Enqueued after every chunk dispatch above, so it runs once all chunks are scheduled.
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                guard self.streamID == id else { return }
+                player.finishAppending()
+            }
+        }
+        if streamID == id { status = "再生中です。" }
+    }
+
+    private func streamDidFinish(_ id: UUID) {
+        guard streamID == id else { return }
+        streamPlayer = nil; streamID = nil
+        isPlaying = false
+        playbackPosition = result?.audioSeconds ?? 0
+        status = "再生が完了しました。"
+        resumeListeningIfIdle()
     }
 
     func stop() {
         task?.cancel()
+        stopRelay()
         stopPlayback()
         status = busy ? "停止しています…" : "停止しました。"
     }
@@ -184,6 +326,11 @@ struct SavedVoice: Codable, Identifiable, Hashable {
 
     func togglePlayback() {
         guard !busy, !recording else { return }
+        if streamPlayer != nil {
+            stopPlayback()
+            status = "停止しました。"
+            return
+        }
         if isPlaying {
             player?.pause()
             isPlaying = false
@@ -222,6 +369,8 @@ struct SavedVoice: Codable, Identifiable, Hashable {
     }
 
     private func stopPlayback() {
+        streamID = nil
+        streamPlayer?.stop(); streamPlayer = nil
         playbackTimer?.invalidate(); playbackTimer = nil
         player?.stop(); player = nil
         isPlaying = false; playbackPosition = 0
@@ -357,6 +506,114 @@ struct SavedVoice: Codable, Identifiable, Hashable {
         else { defaults.removeObject(forKey: "selectedVoiceID") }
     }
 
+    // MARK: - Speak-to-convert mode
+
+    func toggleRelay() {
+        if relayActive { stopRelay(); status = "変声モードを終了しました。"; return }
+        guard !modelPath.isEmpty else { status = "先にモデルを用意してください。"; return }
+        guard selectedVoice == nil || consent else { status = "利用する声の許可を確認してください。"; return }
+        guard !busy, !recording else { return }
+        relayActive = true
+        Task { @MainActor in
+            let speechAllowed = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0 == .authorized) }
+            }
+            let micAllowed = await AVCaptureDevice.requestAccess(for: .audio)
+            guard self.relayActive else { return }
+            guard speechAllowed, micAllowed else {
+                self.relayActive = false
+                self.report(IrodoriError.invalid("音声認識とマイクのアクセスを許可してください。"))
+                return
+            }
+            guard self.recognizer?.isAvailable == true else {
+                self.relayActive = false
+                self.report(IrodoriError.invalid("日本語の音声認識を利用できません。"))
+                return
+            }
+            do { try self.listen() } catch { self.stopRelay(); self.report(error) }
+        }
+    }
+
+    private func stopRelay() {
+        relayActive = false
+        stopListening()
+    }
+
+    private func resumeListeningIfIdle() {
+        guard relayActive, !busy, streamPlayer == nil, recognitionRequest == nil else { return }
+        do { try listen() } catch { stopRelay(); report(error) }
+    }
+
+    private func listen() throws {
+        guard relayActive, !busy, recognitionRequest == nil, let recognizer else { return }
+        stopPlayback()
+        #if os(iOS)
+        // One play-and-record session for the whole mode avoids re-configuring audio between turns.
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+        try session.setActive(true)
+        #endif
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.addsPunctuation = true
+        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+        let input = micEngine.inputNode
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buffer, _ in
+            request.append(buffer)
+        }
+        micEngine.prepare()
+        try micEngine.start()
+        recognitionRequest = request
+        heardText = ""
+        errorMessage = nil
+        status = "聞いています…話し終わると自動で読み上げます。"
+        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            let transcript = result?.bestTranscription.formattedString
+            let isFinal = result?.isFinal ?? false
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.recognitionRequest === request else { return }
+                    if let transcript, !transcript.isEmpty {
+                        self.heardText = transcript
+                        self.armSilenceTimer()
+                    }
+                    if isFinal || error != nil { self.finishUtterance() }
+                }
+            }
+        }
+    }
+
+    private func armSilenceTimer() {
+        silenceTimer?.invalidate()
+        let timer = Timer(timeInterval: endOfSpeechDelay, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.finishUtterance() }
+        }
+        silenceTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopListening() {
+        silenceTimer?.invalidate(); silenceTimer = nil
+        guard recognitionRequest != nil else { return }
+        micEngine.inputNode.removeTap(onBus: 0)
+        micEngine.stop()
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        recognitionRequest = nil; recognitionTask = nil
+    }
+
+    /// Ends the current utterance and speaks it; an empty utterance just restarts listening.
+    private func finishUtterance() {
+        guard recognitionRequest != nil else { return }
+        let spoken = heardText.trimmingCharacters(in: .whitespacesAndNewlines)
+        stopListening()
+        guard relayActive else { return }
+        guard !spoken.isEmpty else { resumeListeningIfIdle(); return }
+        text = spoken
+        work { try await self.synthesizeAndStream() }
+    }
+
     func toggleRecording() {
         if recording {
             recorder?.stop(); recorder = nil; recording = false
@@ -372,7 +629,7 @@ struct SavedVoice: Codable, Identifiable, Hashable {
             } catch { try? FileManager.default.removeItem(at: url); report(error) }
             return
         }
-        guard consent, !busy else { status = "自分の声、または許可のある声を録音してください。"; return }
+        guard consent, !busy, !relayActive else { status = "自分の声、または許可のある声を録音してください。"; return }
         work {
             let allowed = await AVCaptureDevice.requestAccess(for: .audio)
             guard allowed else { throw IrodoriError.invalid("マイクのアクセスが許可されていません。") }

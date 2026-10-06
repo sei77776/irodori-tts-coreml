@@ -179,13 +179,35 @@ struct ContentView: View {
                 .buttonStyle(GenerateButtonStyle())
                 .accessibilityIdentifier("speak")
                 .disabled(model.busy || model.recording || model.modelPath.isEmpty || model.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                if model.busy || model.isPlaying {
+                if model.busy || model.isPlaying || model.relayActive {
                     Button(action: model.stop) {
                         Image(systemName: "stop.fill").frame(width: 48, height: 48)
                     }
                     .buttonStyle(.bordered).buttonBorderShape(.roundedRectangle(radius: 14))
                     .accessibilityLabel("停止").accessibilityIdentifier("stop")
                 }
+            }
+            Button {
+                focusedField = nil
+                model.toggleRelay()
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: model.relayActive ? "mic.fill" : "mic")
+                    Text(model.relayActive ? "変声モードを終了" : "話して変換（変声モード）")
+                }
+                .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.bordered).buttonBorderShape(.roundedRectangle(radius: 14))
+            .tint(model.relayActive ? .red : StudioStyle.accent)
+            .accessibilityIdentifier("relay")
+            .disabled(model.modelPath.isEmpty || model.recording || (model.busy && !model.relayActive))
+            if model.relayActive {
+                Text(model.heardText.isEmpty ? "（話しかけてください）" : model.heardText)
+                    .font(.callout).foregroundStyle(model.heardText.isEmpty ? .tertiary : .primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12).background(StudioStyle.canvas, in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityIdentifier("heardText")
             }
             HStack(alignment: .top, spacing: 9) {
                 if model.busy { ProgressView().controlSize(.small) }
@@ -202,7 +224,7 @@ struct ContentView: View {
         .studioCard()
     }
 
-    private func metrics(_ result: SynthesisResult) -> some View {
+    private func metrics(_ result: SpeechOutput) -> some View {
         HStack(spacing: 0) {
             metric("RTF", value: String(format: "%.3f", result.rtf))
             Divider().frame(height: 34)
@@ -360,6 +382,15 @@ struct ContentView: View {
             .disabled(model.busy || model.recording)
             Text("候補をタップすると入力されます。自由に書き換えても、空欄でも生成できます。")
                 .font(.caption2).foregroundStyle(.secondary)
+            Toggle(isOn: $model.autoTone) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("！や？に合わせて読み分ける").font(.caption.weight(.medium))
+                    Text("文末の記号から、文ごとに話し方の指示を足します")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityIdentifier("autoTone").toggleStyle(.switch)
+            .disabled(model.busy || model.recording)
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 Text("使う声").font(.caption.weight(.medium))
