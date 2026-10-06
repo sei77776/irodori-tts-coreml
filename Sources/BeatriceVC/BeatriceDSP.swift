@@ -73,8 +73,10 @@ public final class BeatriceDSP {
     }
 
     /// - Returns: the waveform (frames·240 samples) and the cumulative pulse phase per sample.
+    /// - Parameter pulseMask: optional per-frame flag; frames marked `false` get no pulses
+    ///   (periodic component), e.g. frames a noise gate considers silent. `nil` = trainer behaviour.
     public func synthesize(_ f: BeatriceFrames, initPhase: Double, excitation: [Float],
-                           fromFrame: Int = 0) -> (wave: [Float], cumulativePhase: [Double]) {
+                           fromFrame: Int = 0, pulseMask: [Bool]? = nil) -> (wave: [Float], cumulativePhase: [Double]) {
         let hop = Self.hop
         let L = f.frames
         let N = L * hop
@@ -99,7 +101,7 @@ public final class BeatriceDSP {
         let dTheta = Float(-2 * Double.pi / 512)
         var i = max(0, s0 * hop - 512)
         while i < N - 1 {
-            if phase[i] > phase[i + 1] {
+            if phase[i] > phase[i + 1], pulseMask?[i / hop] ?? true {
                 let numer: Float = 1 - phase[i]
                 let frac = numer / (numer + phase[i + 1])
                 let t = i / hop

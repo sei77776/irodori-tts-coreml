@@ -5,7 +5,7 @@ import XCTest
 /// Compares the Swift port against reference data written by
 /// Beatrice/tools/export_ios_assets.py (PyTorch + the trainer's DSP). Results are printed as
 /// `BEATRICE_RESULT key=value` lines so CI logs carry the numbers.
-final class BeatriceVCTests: XCTestCase {
+class BeatriceVCTests: XCTestCase {
     struct Meta: Decodable {
         struct Stream: Decodable {
             var chunk: Int

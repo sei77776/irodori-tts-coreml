@@ -21,6 +21,15 @@ public final class BeatriceStreamer {
     public let crossfade: Int
     public var context: Int { window - chunk - lookahead }
     public var pitchShiftBins: Float = 0
+    /// Optional input high-pass (16 kHz, applied before the model) against hum / rumble.
+    public var inputHighPass: BeatriceHighPass?
+    /// Optional output high-pass (24 kHz) against the vocoder's low-frequency drift (the pulses'
+    /// DC component can only be positive in the trainer's vocoder).
+    public var outputHighPass: BeatriceHighPass?
+    /// Optional noise gate (nil = the trainer-equivalent output).
+    public var gate: BeatriceNoiseGate?
+    /// Input level (dBFS, high-passed) of the most recent 10 ms frames, newest last (≈ 4 s).
+    public private(set) var recentInputLevelsDB: [Float] = []
     /// Input samples per call / output samples per call.
     public var inputChunkSamples: Int { chunk * Self.inHop }
     public var outputChunkSamples: Int { chunk * Self.outHop }
@@ -48,6 +57,10 @@ public final class BeatriceStreamer {
     }
 
     public func reset() {
+        inputHighPass?.reset()
+        outputHighPass?.reset()
+        gate?.reset()
+        recentInputLevelsDB = []
         history = [Float](repeating: 0, count: window * Self.inHop)
         phase = 0
         previousTail = nil
@@ -58,8 +71,10 @@ public final class BeatriceStreamer {
     /// delayed by the look-ahead (`lookahead` frames).
     public func process(_ input: [Float]) throws -> [Float] {
         precondition(input.count == inputChunkSamples)
-        history.removeFirst(input.count)
-        history.append(contentsOf: input)
+        var x = input
+        inputHighPass?.process(&x)
+        history.removeFirst(x.count)
+        history.append(contentsOf: x)
         chunkIndex += 1
         let hop = Self.outHop
         let windowStart = chunkIndex * Int64(chunk) - Int64(window) // global frame of window frame 0
@@ -72,14 +87,21 @@ public final class BeatriceStreamer {
         if a > 1 { for j in 1..<a { before += Double(nf[j]) } }
         var initPhase = phase - before
         initPhase -= initPhase.rounded(.down)
+        let levels = BeatriceNoiseGate.frameLevelsDB(history)
+        recentInputLevelsDB.append(contentsOf: levels[(window - chunk)...])
+        if recentInputLevelsDB.count > 400 { recentInputLevelsDB.removeFirst(recentInputLevelsDB.count - 400) }
+        let decision = gate?.decide(levels: levels, context: context, chunk: chunk, crossfade: crossfade,
+                                    lookahead: lookahead, windowStart: windowStart)
         let (wave, cumulative) = dsp.synthesize(frames, initPhase: initPhase, excitation: excitation,
-                                                fromFrame: context)
+                                                fromFrame: context, pulseMask: decision?.pulseMask)
         phase = cumulative[b - 1] - cumulative[b - 1].rounded(.down)
         var segment = Array(wave[a..<b])
         if let tail = previousTail {
             for i in 0..<tail.count { segment[i] = tail[i] * (1 - fade[i]) + segment[i] * fade[i] }
         }
         previousTail = Array(wave[b..<(b + crossfade * hop)])
+        if let gate, let decision { gate.apply(&segment, open: decision.open, hop: hop) }
+        outputHighPass?.process(&segment)
         return segment
     }
 }
