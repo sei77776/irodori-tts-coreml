@@ -1,0 +1,82 @@
+name: Beatrice Core ML ベンチ
+
+# beatrice-bench の Core ML 変換・数値一致・1 回あたり推論時間を macOS ランナーで測る。
+# public リポジトリなので macOS ランナーは無料。手動実行と、claude/beatrice-bench ブランチで
+# beatrice-bench/** が変わった push だけで走らせる（Irodori の CI とは独立）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: 計測回数（ウォームアップ後）
+        default: '50'
+      windows:
+        description: 窓長（フレーム, カンマ区切り）
+        default: '60,112'
+  push:
+    branches:
+      - claude/beatrice-bench
+    paths:
+      - 'beatrice-bench/**'
+
+concurrency:
+  group: beatrice-coreml-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: Core ML 変換 + 数値一致 + 遅延
+    runs-on: macos-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: beatrice-bench
+    env:
+      BEATRICE_WORK: ${{ github.workspace }}/beatrice-work
+      RESULTS: ${{ github.workspace }}/beatrice-results
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: beatrice-bench/requirements.txt
+
+      - name: ランナーの機種を記録
+        run: |
+          mkdir -p "$RESULTS"
+          {
+            echo "## Runner hardware"
+            echo '```'
+            sysctl -n machdep.cpu.brand_string || true
+            sysctl -n hw.model || true
+            echo "hv_vmm_present=$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo n/a)"
+            sw_vers || true
+            system_profiler SPHardwareDataType SPDisplaysDataType 2>/dev/null | sed -e '/Serial Number/d' -e '/UUID/d' -e '/Provisioning UDID/d' || true
+            echo '```'
+            echo "VM 上のランナーでは Neural Engine が使えず、GPU も仮想化で遅い可能性がある。CPU_AND_NE / ALL の数値は実機の目安にならないことがある。"
+          } | tee "$RESULTS/runner.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 依存を導入
+        run: python -m pip install -r requirements.txt
+
+      - name: 学習リポジトリと事前学習モデルを取得
+        run: bash fetch_assets.sh
+
+      - name: 変換・数値一致・遅延を測定
+        run: |
+          python -I bench.py --out "$RESULTS" \
+            --iters "${{ github.event.inputs.iters || '50' }}" \
+            --windows "${{ github.event.inputs.windows || '60,112' }}"
+
+      - name: 結果をアップロード
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: beatrice-coreml-bench
+          path: |
+            ${{ env.RESULTS }}/*.json
+            ${{ env.RESULTS }}/*.md
+          if-no-files-found: warn
