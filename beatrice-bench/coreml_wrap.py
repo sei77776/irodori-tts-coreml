@@ -308,7 +308,7 @@ def make_fp32_selector(regions=("vq", "sp", "hz")):
     an op is kept FP32 if it lies between the first and last marker of a selected region in the
     block's op order (trace order). "phone" = every op before the first VQ marker (the phone
     extractor, which runs first in the graph)."""
-    pref = {"vq": "k32a_", "sp": "k32b_", "hz": "k32c_"}
+    pref = {"vq": "k32a_", "sp": "k32b_", "hz": "k32c_", "pf": "k32d_"}
     # "pnet": the pitch-estimator network = ops between the last VQ marker and the first sample_pitch marker
 
     def names(op):
@@ -326,8 +326,10 @@ def make_fp32_selector(regions=("vq", "sp", "hz")):
             for r in regions:
                 if r == "phone":
                     first_vq = next((i for i, o in enumerate(ops) if any(n.startswith("k32a_") for n in names(o))), None)
+                    pf_idx = [i for i, o in enumerate(ops) if any(n.startswith("k32d_") for n in names(o))]
+                    start = pf_idx[-1] + 1 if pf_idx else 0
                     if first_vq is not None:
-                        rr.append((0, first_vq - 1))
+                        rr.append((start, first_vq - 1))
                     continue
                 if r == "pnet":
                     a_ = [i for i, o in enumerate(ops) if any(n.startswith("k32a_") for n in names(o))]
@@ -348,3 +350,88 @@ def make_fp32_selector(regions=("vq", "sp", "hz")):
             return True
         return not any(lo <= me <= hi for lo, hi in rr)
     return sel
+
+
+class PitchFeaturesFast(nn.Module):
+    """Same outputs as PitchFeaturesSafe / the trainer's extract_pitch_features, but
+    - framing by reshape + concat of 160-sample blocks (no 560x560 identity conv)
+    - autocorrelation by real DFT matmuls (no [F,256,304] gather)
+    Ops are named with the k32d_ marker so they can be kept FP32 inside an FP16 model."""
+
+    def __init__(self, hop=160, win=560, max_corr=256, corr_win=304, cutoff=64):
+        super().__init__()
+        assert win == 3 * hop + hop // 2
+        self.hop, self.win, self.max_corr, self.corr_win, self.cutoff = hop, win, max_corr, corr_win, cutoff
+        N = win
+        nb = N // 2 + 1
+        k = torch.arange(nb, dtype=torch.float64)[None, :]
+        t = torch.arange(N, dtype=torch.float64)[:, None]
+        ang = 2 * math.pi * t * k / N
+        C, S = torch.cos(ang), -torch.sin(ang)  # rfft: X = sum x[t] (cos - i sin)
+        c64, s64 = dft_mats(win, cutoff)
+        self.register_buffer("dft_c", c64)
+        self.register_buffer("dft_s", s64)
+        # DFT of the flipped frame = frame @ (rows reversed)
+        self.register_buffer("fl_cs", torch.cat([C.flip(0), S.flip(0)], 1).float())  # [560, 2*nb]
+        # DFT of seg = frame[-304:] zero-padded to 560 at the end
+        self.register_buffer("sg_cs", torch.cat([C[:corr_win], S[:corr_win]], 1).float())  # [304, 2*nb]
+        # inverse real DFT restricted to output indices j in [corr_win, win)
+        j = torch.arange(corr_win, win, dtype=torch.float64)[None, :]
+        kk = torch.arange(nb, dtype=torch.float64)[:, None]
+        w = torch.full((nb, 1), 2.0, dtype=torch.float64); w[0] = 1.0; w[-1] = 1.0
+        ang2 = 2 * math.pi * kk * j / N
+        self.register_buffer("inv_c", (w * torch.cos(ang2) / N).float())   # [nb, 256]
+        self.register_buffer("inv_s", (-w * torch.sin(ang2) / N).float())  # [nb, 256]
+        self.register_buffer("cosw", torch.signal.windows.cosine(win))
+        self.nb = nb
+
+    def forward(self, y):  # y: [B, T], T = W * hop
+        pad = (self.win - self.hop) // 2  # 200
+        hop = self.hop
+        k32d_y = F.pad(y, (pad, pad + hop // 2))  # length (W + 3) * hop
+        nblk = k32d_y.size(-1) // hop
+        k32d_b = k32d_y.view(y.size(0), nblk, hop)
+        W = nblk - 3
+        k32d_fr = torch.cat([k32d_b[:, 0:W], k32d_b[:, 1:W + 1], k32d_b[:, 2:W + 2], k32d_b[:, 3:W + 3, : hop // 2]], -1)
+        k32d_re = k32d_fr @ self.dft_c
+        k32d_im = k32d_fr @ self.dft_s
+        k32d_mag = torch.sqrt(k32d_re * k32d_re + k32d_im * k32d_im)
+        k32d_logp = torch.log10(k32d_mag + 1e-5)
+        re0, im0 = k32d_re[:, :-1], k32d_im[:, :-1]
+        re1, im1 = k32d_re[:, 1:], k32d_im[:, 1:]
+        k32d_dre = re1 * re0 + im1 * im0
+        k32d_dim = im1 * re0 - re1 * im0
+        k32d_dn = torch.sqrt(k32d_dre * k32d_dre + k32d_dim * k32d_dim) + 1e-5
+        k32d_dre2 = F.pad(k32d_dre / k32d_dn, (0, 0, 1, 0))
+        k32d_dim2 = F.pad(k32d_dim / k32d_dn, (0, 0, 1, 0))
+        k32d_inst = torch.cat([k32d_logp, k32d_dre2, k32d_dim2], -1).transpose(1, 2)
+        nb = self.nb
+        k32d_A = k32d_fr @ self.fl_cs
+        k32d_Bs = k32d_fr[..., self.win - self.corr_win:] @ self.sg_cs
+        ar, ai = k32d_A[..., :nb], k32d_A[..., nb:]
+        br, bi = k32d_Bs[..., :nb], k32d_Bs[..., nb:]
+        k32d_pr = ar * br - ai * bi
+        k32d_pi = ar * bi + ai * br
+        k32d_corr = k32d_pr @ self.inv_c + k32d_pi @ self.inv_s  # [B,F,256]
+        k32d_fl = k32d_fr.flip(-1)
+        k32d_en = torch.cumsum(k32d_fl * k32d_fl, -1)
+        e0 = k32d_en[..., self.corr_win - 1:self.corr_win]
+        e = k32d_en[..., self.corr_win:] - k32d_en[..., :-self.corr_win]
+        k32d_cd = torch.clamp(e0 + e - 2.0 * k32d_corr, min=0.0) * (2.0 / self.corr_win)
+        k32d_cd2 = torch.sqrt(k32d_cd).transpose(1, 2)
+        k32d_ew = k32d_fr * self.cosw
+        k32d_e2 = (k32d_ew * k32d_ew).sum(-1, keepdim=True).transpose(1, 2)
+        k32d_e3 = torch.log10(torch.clamp(k32d_e2, min=1e-3)) * 0.5
+        return k32d_inst, k32d_cd2, k32d_e3
+
+
+class StreamNNv3(StreamNNv2):
+    """Single model: fast pitch features (k32d_ region) computed first, then StreamNNv2."""
+
+    def __init__(self, pe, ps, g):
+        super().__init__(pe, ps, g)
+        self.pff = PitchFeaturesFast()
+
+    def forward(self, wav, spk_embed, kv, codebook, pitch_shift_bins):
+        inst, corr, en = self.pff(wav.squeeze(1))
+        return self.forward_pf(wav, inst, corr, en, spk_embed, kv, codebook, pitch_shift_bins)

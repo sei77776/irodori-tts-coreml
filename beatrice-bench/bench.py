@@ -10,7 +10,8 @@ Models (one pseudo-streaming call over a fixed window of W frames = 10 ms each):
   v2_*_W{W}            : same split, main = StreamNNv2 (pitch_hz via lookup table, extra qp output)
                          v2_fp32 / v2_fp16 / v2_isl (VQ, sample_pitch, pitch_hz in FP32)
                          v2_isl_pnet (+ pitch net FP32) / v2_isl_phone_pnet (+ phone extractor FP32)
-  (BEATRICE_MODELS=split,v2_isl ... restricts the set; BEATRICE_DIAG=0 skips diag.py)
+  v3_*_W{W}            : fast pitch features (reshape framing + DFT-matmul autocorr); split or single model
+  (BEATRICE_MODELS=split,v3_single_isl_pnet ... restricts the set; BEATRICE_DIAG=1 runs diag.py)
 Reference: the trainer's own modules in PyTorch FP32 (StreamNN variant "orig").
 """
 import argparse
@@ -32,7 +33,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bt_infer import REPO, load_models  # noqa: E402
-from coreml_wrap import PitchFeaturesSafe, StreamNN, StreamNNv2, make_fp32_selector, speaker_inputs  # noqa: E402
+from coreml_wrap import PitchFeaturesFast, PitchFeaturesSafe, StreamNN, StreamNNv2, StreamNNv3, make_fp32_selector, speaker_inputs  # noqa: E402
 
 import coremltools as ct  # noqa: E402
 
@@ -80,6 +81,15 @@ class Main(nn.Module):
             p.instfreq_embed_1(F.gelu(p.instfreq_embed_0(inst), approximate="tanh"))
             + p.corr_embed_1(F.gelu(p.corr_embed_0(corr), approximate="tanh")), approximate="tanh"))), energy)
         return b.forward(wav, spk_embed, kv, codebook, pitch_shift_bins)
+
+
+class FeatsFast(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.pf = PitchFeaturesFast()
+
+    def forward(self, wav):
+        return self.pf(wav.squeeze(1))
 
 
 class MainV2(nn.Module):
@@ -178,7 +188,7 @@ def main():
 
     pe, ps, g = load_models()
     se, kv, cb = speaker_inputs(g, 0)
-    if os.environ.get("BEATRICE_DIAG", "1") != "0":
+    if os.environ.get("BEATRICE_DIAG", "0") != "0":
         import diag
         try:
             diag.run(pe, ps, g, se, kv, cb, a.out, W=60, can_run=not a.convert_only, precs=("fp32",))
@@ -210,6 +220,8 @@ def main():
             tr_single = torch.jit.trace(safe, (x0, se, kv, cb, zero), check_trace=False)
             tr_feat = torch.jit.trace(fm, (x0,), check_trace=False)
             tr_main = torch.jit.trace(mm, (x0, inst, corr, en, se, kv, cb, zero), check_trace=False)
+            tr_ff = torch.jit.trace(FeatsFast().eval(), (x0,), check_trace=False)
+            tr_v3 = torch.jit.trace(StreamNNv3(pe, ps, g).eval(), (x0, se, kv, cb, zero), check_trace=False)
             tr_v2 = torch.jit.trace(MainV2(StreamNNv2(pe, ps, g).eval()).eval(), (x0, inst, corr, en, se, kv, cb, zero),
                                     check_trace=False)
         single_in = ["wav", "spk_embed", "kv", "codebook", "pitch_shift_bins"]
@@ -222,14 +234,18 @@ def main():
         def mixed(regions):
             return ct.transform.FP16ComputePrecision(op_selector=make_fp32_selector(regions))
         # v2 main: pitch_hz via lookup table (+ qp output); FP32 islands selected by region
+        feat_fast = (tr_ff, ["wav"], [tuple(x0.shape)], ["inst", "corr", "energy"], ct.precision.FLOAT32)
+        isl = ("vq", "sp", "hz", "pnet")
         specs = {
+            # run 37466007702 measured: split, v2_fp32, v2_fp16, v2_isl, v2_isl_pnet, v2_isl_phone_pnet
             f"split_W{W}": [feat, (tr_main, main_in, main_sh, OUT_NAMES, ct.precision.FLOAT16)],
-            f"v2_fp32_W{W}": [feat, (tr_v2, main_in, main_sh, v2_out, ct.precision.FLOAT32)],
-            f"v2_fp16_W{W}": [feat, (tr_v2, main_in, main_sh, v2_out, ct.precision.FLOAT16)],
-            f"v2_isl_W{W}": [feat, (tr_v2, main_in, main_sh, v2_out, mixed(("vq", "sp", "hz")))],
-            f"v2_isl_pnet_W{W}": [feat, (tr_v2, main_in, main_sh, v2_out, mixed(("vq", "sp", "hz", "pnet")))],
-            f"v2_isl_phone_pnet_W{W}": [feat, (tr_v2, main_in, main_sh, v2_out,
-                                              mixed(("phone", "vq", "sp", "hz", "pnet")))],
+            f"v2_isl_phone_pnet_W{W}": [feat, (tr_v2, main_in, main_sh, v2_out, mixed(("phone",) + isl))],
+            # v3: fast pitch features (reshape framing + DFT-matmul autocorrelation)
+            f"v3_split_isl_pnet_W{W}": [feat_fast, (tr_v2, main_in, main_sh, v2_out, mixed(isl))],
+            f"v3_split_isl_phone_pnet_W{W}": [feat_fast, (tr_v2, main_in, main_sh, v2_out, mixed(("phone",) + isl))],
+            f"v3_single_fp32_W{W}": [(tr_v3, single_in, single_sh, v2_out, ct.precision.FLOAT32)],
+            f"v3_single_isl_pnet_W{W}": [(tr_v3, single_in, single_sh, v2_out, mixed(("pf",) + isl))],
+            f"v3_single_isl_phone_pnet_W{W}": [(tr_v3, single_in, single_sh, v2_out, mixed(("pf", "phone") + isl))],
         }
         only = os.environ.get("BEATRICE_MODELS")
         if only:
