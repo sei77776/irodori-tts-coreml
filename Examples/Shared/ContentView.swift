@@ -454,13 +454,135 @@ struct ContentView: View {
                 .disabled(!model.recording && !model.consent)
             }
             .font(.caption.weight(.medium)).buttonStyle(.bordered).disabled(model.busy)
-            if model.recording {
-                Label("録音中 · 3〜10秒を目安に停止してください", systemImage: "record.circle")
-                    .font(.caption).foregroundStyle(.red)
+            Toggle(isOn: $model.gentleDenoise) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("雑音を弱める（控えめ）").font(.caption.weight(.medium))
+                    Text("まわりの音が気になるときだけ。静かな場所ならオフのままがおすすめです")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
             }
-            Text("録音・取り込んだ声は一覧に追加され、上の「使う声」から切り替えられます。")
+            .accessibilityIdentifier("gentleDenoise").toggleStyle(.switch)
+            .disabled(model.busy || model.recording)
+            if model.recording { recordingPanel }
+            if !model.micDescription.isEmpty && (model.recording || model.pendingReference?.fromRecording == true) {
+                Label("マイク: \(model.micDescription)", systemImage: "mic")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            if let warning = model.micWarning, model.recording || model.pendingReference?.fromRecording == true {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.orange)
+            }
+            if let pending = model.pendingReference, !model.recording { pendingPanel(pending) }
+            Text("録音は最初の0.5秒ほど静かにしてから話し始めます。登録した声は上の「使う声」から切り替えられます。")
                 .font(.caption2).foregroundStyle(.secondary)
         }.studioCard()
+    }
+
+    /// Live guidance while recording: a silent lead-in for the noise profile, then a level meter.
+    private var recordingPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "record.circle").foregroundStyle(.red)
+                Text(model.recordPhase == .quiet ? "そのまま静かに…" : "話してください")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                Text(String(format: "%.1f 秒", model.recordSeconds))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule().fill(levelColor)
+                        .frame(width: geometry.size.width * CGFloat(min(1, max(0, (model.inputLevelDB + 60) / 60))))
+                }
+            }
+            .frame(height: 10)
+            .accessibilityIdentifier("inputLevel")
+            Text(levelText).font(.caption).foregroundStyle(levelColor)
+        }
+        .padding(12)
+        .background(StudioStyle.canvas, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var levelText: String {
+        if model.recordPhase == .quiet { return "まわりの音を測っています。話さずにお待ちください" }
+        switch model.levelHint {
+        case .quiet?: return "声が小さいです。もう少し近づくか、はっきり話してください"
+        case .loud?: return "大きすぎます。少しマイクから離れてください"
+        case .good?: return "ちょうどいい大きさです"
+        case nil: return "3〜10秒くらい話して、停止してください"
+        }
+    }
+
+    private var levelColor: Color {
+        if model.recordPhase == .quiet { return .secondary }
+        switch model.levelHint {
+        case .quiet?: return .orange
+        case .loud?: return .red
+        default: return StudioStyle.accent
+        }
+    }
+
+    /// Result of a recording or import: score, reasons, A/B listening and the decision.
+    private func pendingPanel(_ pending: PendingReference) -> some View {
+        let quality = pending.quality
+        let color: Color = quality.grade == .good ? StudioStyle.accent : quality.grade == .fair ? .orange : .red
+        let icon = quality.grade == .good ? "checkmark.circle.fill"
+            : quality.grade == .fair ? "exclamationmark.circle.fill" : "arrow.counterclockwise.circle.fill"
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: icon).foregroundStyle(color)
+                Text(pending.fromRecording ? "録音の評価: " : "音声の評価: ").font(.subheadline.weight(.semibold))
+                    + Text(quality.grade.label).font(.subheadline.weight(.bold)).foregroundColor(color)
+            }
+            .accessibilityIdentifier("referenceGrade")
+            VStack(alignment: .leading, spacing: 4) {
+                if quality.reasons.isEmpty {
+                    Text("雑音が少なく、声の大きさもちょうどいいです。").font(.caption)
+                }
+                ForEach(quality.reasons, id: \.self) { reason in
+                    Text("・\(reason)").font(.caption).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Text(String(format: "使える長さ %.1f 秒 · 声と雑音の差 %.0f dB%@", quality.usableSeconds,
+                        max(0, quality.snrDB), pending.noiseReduced ? " · 雑音を弱めています" : ""))
+                .font(.caption2).foregroundStyle(.secondary)
+            HStack {
+                Button { model.togglePreview(.clean) } label: {
+                    Label(model.previewing == .clean ? "止める" : "整えた音を聞く",
+                          systemImage: model.previewing == .clean ? "stop.fill" : "play.fill")
+                }
+                .accessibilityIdentifier("previewClean")
+                Button { model.togglePreview(.raw) } label: {
+                    Label(model.previewing == .raw ? "止める" : "元の音を聞く",
+                          systemImage: model.previewing == .raw ? "stop.fill" : "play")
+                }
+                .accessibilityIdentifier("previewRaw")
+            }
+            .font(.caption.weight(.medium)).buttonStyle(.bordered)
+            HStack {
+                Button(action: model.registerPending) {
+                    Label("この声で登録", systemImage: "checkmark")
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("registerReference")
+                .disabled(!quality.hasSpeech || !model.consent)
+                Spacer(minLength: 4)
+                Button(action: model.retakePending) {
+                    Label(pending.fromRecording ? "録り直す" : "取り消す",
+                          systemImage: pending.fromRecording ? "arrow.counterclockwise" : "xmark")
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("retakeReference")
+            }
+            .font(.caption.weight(.medium))
+            Text("元の録音も残してあるので、「雑音を弱める」を切り替えると整え直します。")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .disabled(model.busy)
+        .padding(12)
+        .background(StudioStyle.canvas, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(color.opacity(0.35), lineWidth: 1))
     }
 
     /// Short Japanese style instructions in the same form as the SDK examples.

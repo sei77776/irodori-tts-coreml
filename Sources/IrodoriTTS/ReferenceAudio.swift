@@ -35,6 +35,25 @@ public enum ReferenceAudio {
         return Data(bytes: samples, count: Int(target.frameLength) * MemoryLayout<Float>.size)
     }
 
+    /// Decodes reference audio to 48 kHz mono Float32 samples.
+    public static func readSamples(_ url: URL) throws -> [Float] {
+        let data = try read(url)
+        return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+
+    /// Writes 48 kHz mono Float32 samples as a 16-bit WAV (clamped to ±1, rounded).
+    public static func writeWAV(samples: [Float], to url: URL) throws {
+        var pcm = Data(count: samples.count * 2)
+        pcm.withUnsafeMutableBytes { raw in
+            let out = raw.bindMemory(to: Int16.self)
+            for (i, sample) in samples.enumerated() {
+                let clamped = max(-1, min(1, sample.isFinite ? sample : 0))
+                out[i] = Int16(clamping: Int((clamped * 32767).rounded())).littleEndian
+            }
+        }
+        try writeWAV(pcm16: pcm, to: url)
+    }
+
     public static func writeWAV(pcm16: Data, to url: URL) throws {
         guard !pcm16.isEmpty, pcm16.count.isMultiple(of: 2), pcm16.count < Int(UInt32.max) - 36 else {
             throw IrodoriError.invalid("Invalid 48 kHz mono PCM16")
