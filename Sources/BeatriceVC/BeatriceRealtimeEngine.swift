@@ -155,6 +155,10 @@ public final class BeatriceRealtimeEngine {
         public var inputLevelDB: Float = -120
         public var gateThresholdDB: Float?
         public var gateOpen = false
+        /// median pitch (Hz, after the pitch shift) of recent frames that produce pulses, and the
+        /// share of recent frames that produce pulses (≈ "voiced")
+        public var pitchMedianHz: Float = 0
+        public var voicedPercent: Double = 0
         /// rough end-to-end estimate: I/O buffers + hardware latency + chunk + look-ahead
         /// + inference + output jitter buffer
         public var estimatedLatencyMs = 0.0
@@ -180,7 +184,8 @@ public final class BeatriceRealtimeEngine {
     private var streamer: BeatriceStreamer?
     /// output samples buffered before playback starts (and again after an underrun)
     private var prebufferSamples = 0
-    private var recording: (input: [Float], output: [Float], remaining: Int)?
+    private var recording: (input: [Float], output: [Float], frames: [BeatriceStreamer.FrameInfo], remaining: Int)?
+    private var recentFrames: [BeatriceStreamer.FrameInfo] = []
     var recordConvertedInput = false
     private(set) var convertedInput: [Float] = []
     private static let inFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
@@ -217,6 +222,7 @@ public final class BeatriceRealtimeEngine {
         outputRing.removeAll()
         counters.update { $0 = AudioThreadCounters.Values() }
         prebufferSamples = streamer.outputChunkSamples + Int(prebuffer * 24_000)
+        recentFrames = []
         stateLock.lock()
         stats = Stats()
         timings = []
@@ -252,10 +258,8 @@ public final class BeatriceRealtimeEngine {
         let ring = self.rawRing, threadCounters = self.counters
         var expectedTime = -1.0
         let sink = AVAudioSinkNode { (timestamp, frameCount, abl) -> OSStatus in
-            let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
-            guard let raw = buffers[0].mData else { return noErr }
             let n = Int(frameCount)
-            ring.write(raw.assumingMemoryBound(to: Float.self), n, stride: stride)
+            Self.writeChannel0(abl, frames: n, stride: stride, to: ring)
             let t = timestamp.pointee
             let jump = t.mFlags.contains(.sampleTimeValid) && expectedTime >= 0
                 && abs(t.mSampleTime - expectedTime) > 0.5
@@ -329,6 +333,14 @@ public final class BeatriceRealtimeEngine {
         #endif
     }
 
+    /// Copies channel 0 of a float32 AudioBufferList (deinterleaved: first buffer; interleaved:
+    /// every `stride`-th sample) into the ring. Runs on the audio thread.
+    static func writeChannel0(_ abl: UnsafePointer<AudioBufferList>, frames n: Int, stride: Int, to ring: FloatRing) {
+        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
+        guard buffers.count > 0, let raw = buffers[0].mData else { return }
+        ring.write(raw.assumingMemoryBound(to: Float.self), n, stride: stride)
+    }
+
     /// nil turns the gate off. Takes effect on the next chunk.
     public func setGateThreshold(_ db: Float?) {
         queue.async { [weak self] in
@@ -362,16 +374,16 @@ public final class BeatriceRealtimeEngine {
     public func recordDiagnostics(seconds: Double, to directory: URL) async throws -> [URL] {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
-                self?.recording = ([], [], Int(seconds * 100))
+                self?.recording = ([], [], [], Int(seconds * 100))
                 cont.resume()
             }
         }
         try? await Task.sleep(nanoseconds: UInt64((seconds + 0.5) * 1e9))
-        let data: (input: [Float], output: [Float])? = await withCheckedContinuation { cont in
+        let data: (input: [Float], output: [Float], frames: [BeatriceStreamer.FrameInfo])? = await withCheckedContinuation { cont in
             queue.async { [weak self] in
                 let r = self?.recording
                 self?.recording = nil
-                cont.resume(returning: r.map { (input: $0.input, output: $0.output) })
+                cont.resume(returning: r.map { (input: $0.input, output: $0.output, frames: $0.frames) })
             }
         }
         guard let data, !data.input.isEmpty else { throw BeatriceError.unsupported("録音できませんでした（変換中に実行してください）。") }
@@ -379,7 +391,25 @@ public final class BeatriceRealtimeEngine {
         let outURL = directory.appendingPathComponent("beatrice-output.wav")
         try Self.writeWAV(data.input, sampleRate: 16_000, to: inURL)
         try Self.writeWAV(data.output, sampleRate: 24_000, to: outURL)
-        return [inURL, outURL]
+        let jsonURL = directory.appendingPathComponent("beatrice-frames.json")
+        let s = snapshot()
+        let settings: [String: Any] = ["chunkMs": s.chunkMs, "contextMs": s.contextMs, "lookaheadMs": s.lookaheadMs,
+                         "inputSampleRate": s.inputSampleRate, "inputChannels": s.inputChannels,
+                         "outputSampleRate": s.outputSampleRate, "ioBufferDuration": s.ioBufferDuration,
+                         "voiceProcessing": s.voiceProcessing, "gateThresholdDB": s.gateThresholdDB.map { Double($0) as Any } ?? NSNull(),
+                         "inferenceMedianMs": s.inferenceMedianMs, "underruns": s.underruns,
+                         "inputTimestampJumps": s.inputTimestampJumps, "renderTimestampJumps": s.renderTimestampJumps]
+        let frames: [[String: Any]] = data.frames.map { f -> [String: Any] in
+            ["pitchHz": Double(f.pitchHz), "inputLevelDB": Double(f.inputLevelDB), "gateOpen": f.gateOpen, "pulses": f.pulses]
+        }
+        let doc: [String: Any] = [
+            "note": "one entry per 10 ms output frame; pitchHz after the pitch shift; inputLevelDB = model input (after gain / high-pass)",
+            "settings": settings,
+            "frames": frames,
+        ]
+        let json = try JSONSerialization.data(withJSONObject: doc, options: [.prettyPrinted, .sortedKeys])
+        try json.write(to: jsonURL)
+        return [inURL, outURL, jsonURL]
     }
 
     static func writeWAV(_ x: [Float], sampleRate: Double, to url: URL) throws {
@@ -518,16 +548,22 @@ public final class BeatriceRealtimeEngine {
                 // bound output latency against clock drift: keep at most three chunks queued
                 outputRing.trim(keep: prebufferSamples + 2 * streamer.outputChunkSamples)
                 if var r = recording, r.remaining > 0 {
-                    r.input += chunk; r.output += y; r.remaining -= streamer.chunk
+                    r.input += chunk; r.output += y; r.frames += streamer.lastFrames; r.remaining -= streamer.chunk
                     recording = r
                 }
+                recentFrames += streamer.lastFrames
+                if recentFrames.count > 100 { recentFrames.removeFirst(recentFrames.count - 100) }
             } catch {
                 stateLock.lock(); stats.lastError = error.localizedDescription; stateLock.unlock()
             }
             let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
             let level = streamer.recentInputLevelsDB.suffix(streamer.chunk).max() ?? -120
             let open = streamer.gate.map { $0.gain > 0.5 } ?? true
+            let voiced = recentFrames.filter { $0.pulses && $0.gateOpen }
+            let pitches = voiced.map(\.pitchHz).sorted()
             stateLock.lock()
+            stats.pitchMedianHz = pitches.isEmpty ? 0 : pitches[pitches.count / 2]
+            stats.voicedPercent = recentFrames.isEmpty ? 0 : 100 * Double(voiced.count) / Double(recentFrames.count)
             timings.append(ms)
             if timings.count > 200 { timings.removeFirst(timings.count - 200) }
             let sorted = timings.sorted()

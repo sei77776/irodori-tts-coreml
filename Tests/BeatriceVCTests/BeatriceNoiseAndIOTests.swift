@@ -207,4 +207,69 @@ final class BeatriceNoiseAndIOTests: BeatriceVCTests {
         XCTAssertGreaterThan(worstIn, 60)
         XCTAssertGreaterThan(worstOut, 60)
     }
+
+    /// Channel layouts the input node may deliver: mono, stereo deinterleaved, stereo interleaved.
+    func testInputChannelExtraction() throws {
+        let n = 480
+        let left = sine(440, rate: 48_000, count: n), right = sine(1000, rate: 48_000, count: n, amp: 0.1)
+        for (channels, interleaved) in [(1, false), (2, false), (2, true)] {
+            let fmt = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                                  channels: AVAudioChannelCount(channels), interleaved: interleaved))
+            let buf = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n)))
+            buf.frameLength = AVAudioFrameCount(n)
+            let abl = UnsafeMutableAudioBufferListPointer(buf.mutableAudioBufferList)
+            if interleaved {
+                let p = abl[0].mData!.assumingMemoryBound(to: Float.self)
+                for i in 0..<n { p[2 * i] = left[i]; p[2 * i + 1] = right[i] }
+            } else {
+                for c in 0..<channels {
+                    let p = abl[c].mData!.assumingMemoryBound(to: Float.self)
+                    for i in 0..<n { p[i] = c == 0 ? left[i] : right[i] }
+                }
+            }
+            let ring = FloatRing(capacity: 4096)
+            BeatriceRealtimeEngine.writeChannel0(buf.audioBufferList, frames: n, stride: interleaved ? channels : 1, to: ring)
+            let got = try XCTUnwrap(ring.read(n))
+            XCTAssertEqual(got, left, "channels=\(channels) interleaved=\(interleaved)")
+        }
+    }
+
+    /// The pretrained pitch estimator reports a very low pitch (bin 18 ≈ 62.6 Hz) for noise and
+    /// silence and the vocoder turns it into a constant pulse train ("buzz"). Measures the buzz with
+    /// microphone-like noise and checks that suppressing those pulses leaves speech unchanged.
+    func testNoisePitchSuppression() throws {
+        let (plain, masked) = try makeStreamer()
+        masked.noisePitchMaxBin = 24
+        let speech = try load("stream_in")
+        var rng = SystemRandomNumberGenerator()
+        for noiseDB in [-60.0, -50.0, -40.0] {
+            let amp = Float(pow(10, noiseDB / 20) * 3.0.squareRoot()) // uniform: rms = amp / sqrt(3)
+            let noise = (0..<speech.count).map { _ in Float.random(in: -1...1, using: &rng) * amp }
+            plain.reset(); masked.reset()
+            let a = try run(plain, noise), b = try run(masked, noise)
+            let lowPitch = plain.lastFrames.filter { 96 * log2($0.pitchHz / 55) <= 24.5 }.count
+            report("noise\(Int(noiseDB))_out_rms_db_plain", db(rms(a[...])))
+            report("noise\(Int(noiseDB))_out_rms_db_noise_pitch_suppressed", db(rms(b[...])))
+            report("noise\(Int(noiseDB))_last_chunk_low_pitch_frames", Double(lowPitch))
+        }
+        plain.reset(); masked.reset()
+        let a = try run(plain, speech), b = try run(masked, speech)
+        var s = 0.0, e = 0.0
+        for i in 0..<a.count { s += Double(a[i] * a[i]); e += Double((a[i] - b[i]) * (a[i] - b[i])) }
+        let snr = 10 * log10(s / max(e, 1e-30))
+        report("speech_noise_pitch_suppressed_vs_plain_snr_db", snr)
+        XCTAssertGreaterThan(snr, 15)
+        // quiet input (e.g. measurement mode): pitch is still tracked
+        plain.reset()
+        let quiet = speech.map { $0 * 0.03 }
+        var pitches: [Float] = []
+        let n = plain.inputChunkSamples
+        for k in 0..<(quiet.count / n) {
+            _ = try plain.process(Array(quiet[(k * n)..<((k + 1) * n)]))
+            pitches += plain.lastFrames.map(\.pitchHz)
+        }
+        let voiced = pitches.filter { 96 * log2($0 / 55) > 24.5 }.sorted()
+        report("quiet_speech_minus30db_voiced_percent", 100 * Double(voiced.count) / Double(max(1, pitches.count)))
+        report("quiet_speech_minus30db_pitch_median_hz", Double(voiced.isEmpty ? 0 : voiced[voiced.count / 2]))
+    }
 }

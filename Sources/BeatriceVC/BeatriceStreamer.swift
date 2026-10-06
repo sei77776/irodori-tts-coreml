@@ -28,6 +28,22 @@ public final class BeatriceStreamer {
     public var outputHighPass: BeatriceHighPass?
     /// Optional noise gate (nil = the trainer-equivalent output).
     public var gate: BeatriceNoiseGate?
+    /// Linear gain applied to the 16 kHz input before everything else (1 = unchanged).
+    public var inputGain: Float = 1
+    /// Skip the pulse train in frames whose estimated pitch (before the user's pitch shift) is at or
+    /// below `noisePitchMaxBin` (bin 24 ≈ 65.5 Hz). The pretrained pitch estimator never reports
+    /// "unvoiced"; for silence and background noise it settles on a very low pitch (bin 18 ≈ 62.6 Hz),
+    /// and the vocoder then emits a constant low pulse train — an audible buzz with real
+    /// microphone noise. Human speech rarely goes that low. `nil` = trainer behaviour.
+    public var noisePitchMaxBin: Int?
+    /// Per-frame information about the most recent output chunk (for diagnostics).
+    public struct FrameInfo: Codable, Sendable {
+        public var pitchHz: Float
+        public var inputLevelDB: Float
+        public var gateOpen: Bool
+        public var pulses: Bool
+    }
+    public private(set) var lastFrames: [FrameInfo] = []
     /// Input level (dBFS, high-passed) of the most recent 10 ms frames, newest last (≈ 4 s).
     public private(set) var recentInputLevelsDB: [Float] = []
     /// Input samples per call / output samples per call.
@@ -72,6 +88,7 @@ public final class BeatriceStreamer {
     public func process(_ input: [Float]) throws -> [Float] {
         precondition(input.count == inputChunkSamples)
         var x = input
+        if inputGain != 1 { for i in 0..<x.count { x[i] *= inputGain } }
         inputHighPass?.process(&x)
         history.removeFirst(x.count)
         history.append(contentsOf: x)
@@ -92,8 +109,21 @@ public final class BeatriceStreamer {
         if recentInputLevelsDB.count > 400 { recentInputLevelsDB.removeFirst(recentInputLevelsDB.count - 400) }
         let decision = gate?.decide(levels: levels, context: context, chunk: chunk, crossfade: crossfade,
                                     lookahead: lookahead, windowStart: windowStart)
+        var pulseMask = decision?.pulseMask
+        if let maxBin = noisePitchMaxBin {
+            var mask = pulseMask ?? [Bool](repeating: true, count: window)
+            for t in 0..<window {
+                let bin = Int((96 * log2(max(frames.pitchHz[t], 1) / 55)).rounded()) - Int(pitchShiftBins.rounded())
+                if bin <= maxBin { mask[t] = false }
+            }
+            pulseMask = mask
+        }
         let (wave, cumulative) = dsp.synthesize(frames, initPhase: initPhase, excitation: excitation,
-                                                fromFrame: context, pulseMask: decision?.pulseMask)
+                                                fromFrame: context, pulseMask: pulseMask)
+        lastFrames = (0..<chunk).map { j in
+            FrameInfo(pitchHz: frames.pitchHz[context + j], inputLevelDB: levels[context + j],
+                      gateOpen: decision?.open[j] ?? true, pulses: pulseMask?[context + j] ?? true)
+        }
         phase = cumulative[b - 1] - cumulative[b - 1].rounded(.down)
         var segment = Array(wave[a..<b])
         if let tail = previousTail {

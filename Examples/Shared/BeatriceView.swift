@@ -16,8 +16,9 @@ struct VoiceChangerSettings: Codable, Equatable {
     var micLowCut = true
     var outputLowCut = true
     var voiceProcessing = false
+    var micGainDB = 0.0               // 0 ... +24 dB
 
-    static let key = "BeatriceVoiceChangerSettings.v1"
+    static let key = "BeatriceVoiceChangerSettings.v2"
 
     static func load() -> VoiceChangerSettings {
         guard let data = UserDefaults.standard.data(forKey: key),
@@ -56,6 +57,7 @@ struct VoiceChangerSettings: Codable, Equatable {
     @Published private(set) var stats = BeatriceRealtimeEngine.Stats()
     @Published private(set) var voices: [BeatriceManifest.Voice] = []
     @Published private(set) var credits: [String] = []
+    @Published private(set) var diagnosticFiles: [URL] = []
 
     private var assets: BeatriceAssets?
     private let engine = BeatriceRealtimeEngine()
@@ -133,6 +135,8 @@ struct VoiceChangerSettings: Codable, Equatable {
                     _ = try st.process([Float](repeating: 0, count: st.inputChunkSamples))
                     st.inputHighPass = s.micLowCut ? BeatriceHighPass(cutoff: 75, sampleRate: 16_000) : nil
                     st.outputHighPass = s.outputLowCut ? BeatriceHighPass(cutoff: 50, sampleRate: 24_000) : nil
+                    st.noisePitchMaxBin = s.outputLowCut ? 24 : nil
+                    st.inputGain = Float(pow(10, s.micGainDB / 20))
                     st.gate = s.gateThresholdDB.map { BeatriceNoiseGate(thresholdDB: $0) }
                     return st
                 }.value
@@ -171,7 +175,8 @@ struct VoiceChangerSettings: Codable, Equatable {
             do {
                 let dir = try FileManager.default.url(for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                 let files = try await engine.recordDiagnostics(seconds: 5, to: dir)
-                status = "保存しました（「ファイル」アプリ → このアプリ）: " + files.map(\.lastPathComponent).joined(separator: ", ")
+                diagnosticFiles = files
+                status = "保存しました。「共有」から送れます（「ファイル」アプリのこのアプリのフォルダにもあります）。"
             } catch {
                 status = error.localizedDescription
             }
@@ -243,7 +248,15 @@ struct BeatriceView: View {
                     }
                     Group {
                         Toggle("マイクの低い雑音（空調・振動）をカット", isOn: $model.settings.micLowCut)
-                        Toggle("変換した声の低いうなりをカット", isOn: $model.settings.outputLowCut)
+                        Toggle(isOn: $model.settings.outputLowCut) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("「ブーン」という低いうなりを抑える")
+                                Text("声のない部分でモデルが出す低い音（約 63Hz）を止めます。").font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        Stepper(value: $model.settings.micGainDB, in: 0...24, step: 6) {
+                            Text(model.settings.micGainDB == 0 ? "マイクの音量：そのまま" : String(format: "マイクの音量：+%.0f dB", model.settings.micGainDB))
+                        }
                         Toggle(isOn: $model.settings.voiceProcessing) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("端末の雑音除去を使う")
@@ -307,6 +320,8 @@ struct BeatriceView: View {
                     row("音の途切れ", "\(model.stats.droppedChunks + model.stats.underruns) 回")
                     row("遅れ（目安）", String(format: "約 %.0f ms", model.stats.estimatedLatencyMs))
                     row("入力の大きさ", inputLevelText)
+                    row("推定した声の高さ", model.stats.pitchMedianHz > 0 ? String(format: "%.0f Hz", model.stats.pitchMedianHz) : "—")
+                    row("声として扱った割合", String(format: "%.0f %%", model.stats.voicedPercent))
                     DisclosureGroup("詳細", isExpanded: $showDetails) {
                         detail("変換時間（中央値 / 最大）", String(format: "%.1f / %.1f ms", model.stats.inferenceMedianMs, model.stats.inferenceMaxMs))
                         detail("処理したまとまり", "\(model.stats.chunks)")
@@ -323,9 +338,15 @@ struct BeatriceView: View {
                         detail("端末の雑音除去", model.stats.voiceProcessing ? "オン" : "オフ")
                         Text("遅れ（目安）= I/O バッファ×2 ＋ 機器の遅れ ＋ 処理単位 ＋ ため込み ＋ 先読み 40ms ＋ 変換時間")
                             .font(.caption2).foregroundStyle(.secondary)
-                        Button("診断用に 5 秒録音して保存") { model.recordDiagnostics() }
+                        Button("診断用に 5 秒録音する") { model.recordDiagnostics() }
                             .disabled(!model.running)
                             .font(.caption)
+                        if !model.diagnosticFiles.isEmpty {
+                            ShareLink(items: model.diagnosticFiles) {
+                                Label("診断ファイルを共有（入力 WAV・出力 WAV・フレーム情報 JSON）", systemImage: "square.and.arrow.up")
+                            }
+                            .font(.caption)
+                        }
                     }
                     .font(.caption)
                 }
