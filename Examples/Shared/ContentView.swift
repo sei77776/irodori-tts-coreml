@@ -31,6 +31,7 @@ struct ContentView: View {
     @State private var renamingVoice: SavedVoice?
     @State private var renameText = ""
     @State private var deletingVoice: SavedVoice?
+    @State private var showingVoiceChanger = false
     #if os(macOS)
     @State private var exportingWAV = false
     @State private var wavDocument: SampleWAVDocument?
@@ -65,6 +66,7 @@ struct ContentView: View {
             .scrollDismissesKeyboard(.interactively)
         }
         .tint(StudioStyle.accent)
+        .sheet(isPresented: $showingVoiceChanger) { BeatriceView() }
         .fileImporter(isPresented: $importing,
                       allowedContentTypes: importKind == .model ? [.folder] : [.audio]) { result in
             switch result {
@@ -125,6 +127,14 @@ struct ContentView: View {
                 Text("オンデバイス音声合成").font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 8)
+            Button {
+                showingVoiceChanger = true
+            } label: {
+                Label("リアルタイム変声（実験）", systemImage: "waveform.badge.mic")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("openVoiceChanger")
             Text("Core ML")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .padding(.horizontal, 10).padding(.vertical, 7)
