@@ -166,6 +166,13 @@ def main():
 
     pe, ps, g = load_models()
     se, kv, cb = speaker_inputs(g, 0)
+    if os.environ.get("BEATRICE_DIAG", "1") != "0":
+        import diag
+        try:
+            diag.run(pe, ps, g, se, kv, cb, a.out, W=60, can_run=not a.convert_only)
+        except Exception as e:  # noqa: BLE001
+            report["errors"].append({"stage": "diag", "error": f"{type(e).__name__}: {e}"[:2000]})
+            traceback.print_exc()
     ref_model = StreamNN(pe, ps, g, "orig").eval()
     safe = StreamNN(pe, ps, g, "safe").eval()
     wav, sr = sf.read(os.path.join(REPO, TEST_WAV), dtype="float32")
@@ -197,6 +204,7 @@ def main():
         main_sh = [tuple(x0.shape), tuple(inst.shape), tuple(corr.shape), tuple(en.shape)] + single_sh[1:]
         specs = {
             f"single_fp16_W{W}": [(tr_single, single_in, single_sh, OUT_NAMES, ct.precision.FLOAT16)],
+            f"single_fp32_W{W}": [(tr_single, single_in, single_sh, OUT_NAMES, ct.precision.FLOAT32)],
             f"split_W{W}": [(tr_feat, ["wav"], [tuple(x0.shape)], ["inst", "corr", "energy"], ct.precision.FLOAT32),
                             (tr_main, main_in, main_sh, OUT_NAMES, ct.precision.FLOAT16)],
         }
