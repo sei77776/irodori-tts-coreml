@@ -200,4 +200,47 @@ final class BeatriceVCTests: XCTestCase {
         report("stream_call_max_ms", times.max() ?? 0)
         XCTAssertGreaterThan(s, 30)
     }
+
+    /// Drives BeatriceRealtimeEngine's buffering, 48 kHz -> 16 kHz conversion, inference queue and
+    /// output render path in real time without audio hardware (CI has no microphone).
+    func testRealtimeEnginePipelineWithoutAudioHardware() throws {
+        let (model, assets) = try makeModel("fp32")
+        let streamer = BeatriceStreamer(predictor: model, dsp: BeatriceDSP(irWindow: assets.irWindow), chunk: 10)
+        let engine = BeatriceRealtimeEngine()
+        try engine.prepareForTesting(streamer: streamer, inputSampleRate: 48_000)
+        let input = try load("stream_in") // 16 kHz speech, upsampled naively to 48 kHz below
+        let block = 256
+        var mic = [Float](repeating: 0, count: input.count * 3)
+        for i in 0..<mic.count { mic[i] = input[i / 3] }
+        var rendered: [Float] = []
+        var renderBuffer = [Float](repeating: 0, count: 384) // 16 ms at 24 kHz
+        let start = Date()
+        var fed = 0
+        while fed < mic.count {
+            let n = min(block, mic.count - fed)
+            engine.captureForTesting(Array(mic[fed..<(fed + n)]))
+            fed += n
+            // pace like a real device: wait until wall clock catches up with the fed audio
+            let due = Double(fed) / 48_000
+            let ahead = due - Date().timeIntervalSince(start)
+            if ahead > 0 { Thread.sleep(forTimeInterval: ahead) }
+            // pull output at the same rate (24 kHz)
+            while Double(rendered.count + 384) / 24_000 <= Date().timeIntervalSince(start) {
+                renderBuffer.withUnsafeMutableBufferPointer { engine.render($0.baseAddress!, 384) }
+                rendered += renderBuffer
+            }
+        }
+        engine.waitUntilIdle()
+        let stats = engine.snapshot()
+        report("engine_chunks", Double(stats.chunks))
+        report("engine_dropped_chunks", Double(stats.droppedChunks))
+        report("engine_underruns", Double(stats.underruns))
+        report("engine_inference_median_ms", stats.inferenceMedianMs)
+        report("engine_inference_max_ms", stats.inferenceMaxMs)
+        XCTAssertNil(stats.lastError)
+        XCTAssertGreaterThanOrEqual(stats.chunks, input.count / streamer.inputChunkSamples - 1)
+        let energy = rendered.reduce(0.0) { $0 + Double($1 * $1) } / Double(max(1, rendered.count))
+        report("engine_rendered_rms", sqrt(energy))
+        XCTAssertGreaterThan(energy, 1e-6)
+    }
 }

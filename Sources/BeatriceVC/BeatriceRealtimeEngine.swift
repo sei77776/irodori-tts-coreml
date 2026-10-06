@@ -87,7 +87,11 @@ public final class BeatriceRealtimeEngine {
 
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
+    private var sinkNode: AVAudioSinkNode?
     private var converter: AVAudioConverter?
+    private var rawFormat: AVAudioFormat?
+    /// microphone samples at the hardware rate (mono), filled on the audio thread
+    private let rawFIFO = FloatFIFO()
     private let inputFIFO = FloatFIFO()
     private let outputFIFO = FloatFIFO()
     private let queue = DispatchQueue(label: "BeatriceRealtimeEngine.inference", qos: .userInteractive)
@@ -115,6 +119,7 @@ public final class BeatriceRealtimeEngine {
         stop()
         streamer.reset()
         self.streamer = streamer
+        rawFIFO.removeAll()
         inputFIFO.removeAll()
         outputFIFO.removeAll()
         stateLock.lock()
@@ -141,36 +146,35 @@ public final class BeatriceRealtimeEngine {
         guard hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
             throw BeatriceError.unsupported("マイク入力が見つかりません。")
         }
-        guard let conv = AVAudioConverter(from: hwFormat, to: Self.inFormat) else {
-            throw BeatriceError.unsupported("入力形式 \(hwFormat) を 16kHz に変換できません。")
+        try configureInput(sampleRate: hwFormat.sampleRate)
+        // AVAudioSinkNode receives input at the I/O buffer size (installTap may deliver ~100 ms blocks)
+        let channels = Int(hwFormat.channelCount)
+        let interleaved = hwFormat.isInterleaved
+        let sink = AVAudioSinkNode { [weak self] (_, frameCount, abl) -> OSStatus in
+            guard let self else { return noErr }
+            let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
+            guard let raw = buffers[0].mData else { return noErr }
+            let p = raw.assumingMemoryBound(to: Float.self)
+            let n = Int(frameCount)
+            if interleaved && channels > 1 {
+                var mono = [Float](repeating: 0, count: n)
+                for i in 0..<n { mono[i] = p[i * channels] }
+                self.rawFIFO.append(mono)
+            } else {
+                self.rawFIFO.append(p, n)
+            }
+            self.kick()
+            return noErr
         }
-        converter = conv
-        input.installTap(onBus: 0, bufferSize: 256, format: hwFormat) { [weak self] buffer, _ in
-            self?.capture(buffer)
-        }
+        sinkNode = sink
+        engine.attach(sink)
+        engine.connect(input, to: sink, format: hwFormat)
 
-        let outputSamplesPerChunk = streamer.outputChunkSamples
         let source = AVAudioSourceNode(format: Self.outFormat) { [weak self] (_, _, frameCount, abl) -> OSStatus in
             guard let self else { return noErr }
             let buffers = UnsafeMutableAudioBufferListPointer(abl)
             guard let raw = buffers[0].mData else { return noErr }
-            let dst = raw.assumingMemoryBound(to: Float.self)
-            let n = Int(frameCount)
-            self.stateLock.lock()
-            var primed = self.primed
-            self.stateLock.unlock()
-            if !primed, self.outputFIFO.count >= outputSamplesPerChunk {
-                primed = true
-                self.stateLock.lock(); self.primed = true; self.stateLock.unlock()
-            }
-            var got = 0
-            if primed { got = self.outputFIFO.read(into: dst, n) }
-            if got < n {
-                dst.advanced(by: got).initialize(repeating: 0, count: n - got)
-                if primed {
-                    self.stateLock.lock(); self.stats.underruns += 1; self.stateLock.unlock()
-                }
-            }
+            self.render(raw.assumingMemoryBound(to: Float.self), Int(frameCount))
             return noErr
         }
         sourceNode = source
@@ -196,7 +200,10 @@ public final class BeatriceRealtimeEngine {
 
     public func stop() {
         if engine.isRunning { engine.stop() }
-        engine.inputNode.removeTap(onBus: 0)
+        if let sink = sinkNode {
+            engine.detach(sink)
+            sinkNode = nil
+        }
         if let source = sourceNode {
             engine.detach(source)
             sourceNode = nil
@@ -207,23 +214,84 @@ public final class BeatriceRealtimeEngine {
         #endif
     }
 
-    private func capture(_ buffer: AVAudioPCMBuffer) {
-        guard let converter else { return }
-        let ratio = Self.inFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 32)
+    /// Output render: waits until one chunk is buffered (jitter buffer), then plays continuously;
+    /// an empty buffer after that counts as an underrun.
+    func render(_ dst: UnsafeMutablePointer<Float>, _ n: Int) {
+        let need = streamer?.outputChunkSamples ?? 0
+        stateLock.lock()
+        var primed = self.primed
+        stateLock.unlock()
+        if !primed, outputFIFO.count >= need {
+            primed = true
+            stateLock.lock(); self.primed = true; stateLock.unlock()
+        }
+        var got = 0
+        if primed { got = outputFIFO.read(into: dst, n) }
+        if got < n {
+            dst.advanced(by: got).initialize(repeating: 0, count: n - got)
+            if primed { stateLock.lock(); stats.underruns += 1; stateLock.unlock() }
+        }
+    }
+
+    // MARK: - test hooks (drive the pipeline without audio hardware)
+
+    func prepareForTesting(streamer: BeatriceStreamer, inputSampleRate: Double) throws {
+        streamer.reset()
+        self.streamer = streamer
+        rawFIFO.removeAll(); inputFIFO.removeAll(); outputFIFO.removeAll()
+        try configureInput(sampleRate: inputSampleRate)
+        stateLock.lock()
+        stats = Stats(); timings = []; busy = false; primed = false
+        stateLock.unlock()
+    }
+
+    /// Feeds microphone samples (at the configured input rate) as the sink node would.
+    func captureForTesting(_ samples: [Float]) {
+        rawFIFO.append(samples)
+        kick()
+    }
+
+    func waitUntilIdle() {
+        while true {
+            queue.sync {}
+            stateLock.lock(); let idle = !busy; stateLock.unlock()
+            if idle && rawFIFO.count == 0 && inputFIFO.count < (streamer?.inputChunkSamples ?? 1) { return }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+    }
+
+    private func configureInput(sampleRate: Double) throws {
+        guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+                                       channels: 1, interleaved: false),
+              let conv = AVAudioConverter(from: mono, to: Self.inFormat) else {
+            throw BeatriceError.unsupported("入力 \(sampleRate) Hz を 16kHz に変換できません。")
+        }
+        rawFormat = mono
+        converter = conv
+    }
+
+    /// Runs on the inference queue: hardware-rate samples -> 16 kHz.
+    private func convertPending() {
+        guard let converter, let rawFormat else { return }
+        let n = rawFIFO.count
+        guard n > 0, let inBuf = AVAudioPCMBuffer(pcmFormat: rawFormat, frameCapacity: AVAudioFrameCount(n)),
+              let inData = inBuf.floatChannelData?[0] else { return }
+        let got = rawFIFO.read(into: inData, n)
+        inBuf.frameLength = AVAudioFrameCount(got)
+        let ratio = Self.inFormat.sampleRate / rawFormat.sampleRate
+        let capacity = AVAudioFrameCount(Double(got) * ratio + 64)
         guard let out = AVAudioPCMBuffer(pcmFormat: Self.inFormat, frameCapacity: capacity) else { return }
         var supplied = false
         var error: NSError?
-        converter.convert(to: out, error: &error) { _, status in
+        _ = converter.convert(to: out, error: &error) { _, status in
             if supplied { status.pointee = .noDataNow; return nil }
             supplied = true
             status.pointee = .haveData
-            return buffer
+            return inBuf
         }
         if let data = out.floatChannelData?[0], out.frameLength > 0 {
             inputFIFO.append(data, Int(out.frameLength))
         }
-        kick()
     }
 
     private func kick() {
@@ -239,6 +307,7 @@ public final class BeatriceRealtimeEngine {
         guard let streamer else { return }
         let n = streamer.inputChunkSamples
         while true {
+            convertPending()
             // bound the backlog: keep at most two chunks waiting
             let dropped = inputFIFO.count > 3 * n ? inputFIFO.trim(keep: 2 * n) / n : 0
             if dropped > 0 { stateLock.lock(); stats.droppedChunks += dropped; stateLock.unlock() }
